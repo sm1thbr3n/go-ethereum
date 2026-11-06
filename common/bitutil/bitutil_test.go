@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Adapted from: https://golang.org/src/crypto/cipher/xor_test.go
+// Adapted from: https://go.dev/src/crypto/subtle/xor_test.go
 
 package bitutil
 
@@ -29,13 +29,25 @@ func TestXOR(t *testing.T) {
 				d2 := make([]byte, 1023+alignD)[alignD:]
 
 				XORBytes(d1, p, q)
-				safeXORBytes(d2, p, q)
+				naiveXOR(d2, p, q)
 				if !bytes.Equal(d1, d2) {
 					t.Error("not equal", d1, d2)
 				}
 			}
 		}
 	}
+}
+
+// naiveXOR xors bytes one by one.
+func naiveXOR(dst, a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		dst[i] = a[i] ^ b[i]
+	}
+	return n
 }
 
 // Tests that bitwise AND works for various alignments.
@@ -134,7 +146,7 @@ func benchmarkBaseXOR(b *testing.B, size int) {
 	p, q := make([]byte, size), make([]byte, size)
 
 	for i := 0; i < b.N; i++ {
-		safeXORBytes(p, p, q)
+		naiveXOR(p, p, q)
 	}
 }
 
@@ -190,6 +202,8 @@ func benchmarkBaseOR(b *testing.B, size int) {
 	}
 }
 
+var GloBool bool // Exported global will not be dead-code eliminated, at least not yet.
+
 // Benchmarks the potentially optimized bit testing performance.
 func BenchmarkFastTest1KB(b *testing.B) { benchmarkFastTest(b, 1024) }
 func BenchmarkFastTest2KB(b *testing.B) { benchmarkFastTest(b, 2048) }
@@ -197,9 +211,11 @@ func BenchmarkFastTest4KB(b *testing.B) { benchmarkFastTest(b, 4096) }
 
 func benchmarkFastTest(b *testing.B, size int) {
 	p := make([]byte, size)
+	a := false
 	for i := 0; i < b.N; i++ {
-		TestBytes(p)
+		a = a != TestBytes(p)
 	}
+	GloBool = a // Use of benchmark "result" to prevent total dead code elimination.
 }
 
 // Benchmarks the baseline bit testing performance.
@@ -209,7 +225,9 @@ func BenchmarkBaseTest4KB(b *testing.B) { benchmarkBaseTest(b, 4096) }
 
 func benchmarkBaseTest(b *testing.B, size int) {
 	p := make([]byte, size)
+	a := false
 	for i := 0; i < b.N; i++ {
-		safeTestBytes(p)
+		a = a != safeTestBytes(p)
 	}
+	GloBool = a // Use of benchmark "result" to prevent total dead code elimination.
 }

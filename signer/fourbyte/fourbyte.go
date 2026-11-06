@@ -14,19 +14,19 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-//go:generate go-bindata -nometadata -o 4byte.go -pkg fourbyte 4byte.json
-//go:generate gofmt -s -w 4byte.go
-
 // Package fourbyte contains the 4byte database.
 package fourbyte
 
 import (
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 )
+
+//go:embed 4byte.json
+var embeddedJSON []byte
 
 // Database is a 4byte database with the possibility of maintaining an immutable
 // set (embedded) into the process and a mutable set (loaded and written to file).
@@ -76,16 +76,13 @@ func NewWithFile(path string) (*Database, error) {
 	db := &Database{make(map[string]string), make(map[string]string), path}
 	db.customPath = path
 
-	blob, err := Asset("4byte.json")
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(blob, &db.embedded); err != nil {
+	if err := json.Unmarshal(embeddedJSON, &db.embedded); err != nil {
 		return nil, err
 	}
 	// Custom file may not exist. Will be created during save, if needed.
 	if _, err := os.Stat(path); err == nil {
-		if blob, err = ioutil.ReadFile(path); err != nil {
+		var blob []byte
+		if blob, err = os.ReadFile(path); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(blob, &db.custom); err != nil {
@@ -139,5 +136,5 @@ func (db *Database) AddSelector(selector string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(db.customPath, blob, 0600)
+	return os.WriteFile(db.customPath, blob, 0600)
 }

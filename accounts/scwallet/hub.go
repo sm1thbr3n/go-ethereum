@@ -34,7 +34,7 @@ package scwallet
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,7 +49,7 @@ import (
 )
 
 // Scheme is the URI prefix for smartcard wallets.
-const Scheme = "pcsc"
+const Scheme = "keycard"
 
 // refreshCycle is the maximum time between wallet refreshes (if USB hotplug
 // notifications don't work).
@@ -95,8 +95,9 @@ func (hub *Hub) readPairings() error {
 		}
 		return err
 	}
+	defer pairingFile.Close()
 
-	pairingData, err := ioutil.ReadAll(pairingFile)
+	pairingData, err := io.ReadAll(pairingFile)
 	if err != nil {
 		return err
 	}
@@ -112,7 +113,7 @@ func (hub *Hub) readPairings() error {
 }
 
 func (hub *Hub) writePairings() error {
-	pairingFile, err := os.OpenFile(filepath.Join(hub.datadir, "smartcards.json"), os.O_RDWR|os.O_CREATE, 0755)
+	pairingFile, err := os.OpenFile(filepath.Join(hub.datadir, "smartcards.json"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
@@ -128,11 +129,8 @@ func (hub *Hub) writePairings() error {
 		return err
 	}
 
-	if _, err := pairingFile.Write(pairingData); err != nil {
-		return err
-	}
-
-	return nil
+	_, err = pairingFile.Write(pairingData)
+	return err
 }
 
 func (hub *Hub) pairing(wallet *Wallet) *smartcardPairing {
@@ -152,8 +150,8 @@ func (hub *Hub) setPairing(wallet *Wallet, pairing *smartcardPairing) error {
 }
 
 // NewHub creates a new hardware wallet manager for smartcards.
-func NewHub(scheme string, datadir string) (*Hub, error) {
-	context, err := pcsc.EstablishContext(pcsc.ScopeSystem)
+func NewHub(daemonPath string, scheme string, datadir string) (*Hub, error) {
+	context, err := pcsc.EstablishContext(daemonPath, pcsc.ScopeSystem)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +218,7 @@ func (hub *Hub) refreshWallets() {
 		// Mark the reader as present
 		seen[reader] = struct{}{}
 
-		// If we alreay know about this card, skip to the next reader, otherwise clean up
+		// If we already know about this card, skip to the next reader, otherwise clean up
 		if wallet, ok := hub.wallets[reader]; ok {
 			if err := wallet.ping(); err == nil {
 				continue
@@ -241,7 +239,7 @@ func (hub *Hub) refreshWallets() {
 			card.Disconnect(pcsc.LeaveCard)
 			continue
 		}
-		// Card connected, start tracking in amongs the wallets
+		// Card connected, start tracking among the wallets
 		hub.wallets[reader] = wallet
 		events = append(events, accounts.WalletEvent{Wallet: wallet, Kind: accounts.WalletArrived})
 	}

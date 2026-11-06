@@ -17,37 +17,63 @@
 package tests
 
 import (
-	"math/big"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func TestTransaction(t *testing.T) {
 	t.Parallel()
 
 	txt := new(testMatcher)
-	txt.config(`^Homestead/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-	})
-	txt.config(`^EIP155/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(0),
-		EIP155Block:    big.NewInt(0),
-		EIP158Block:    big.NewInt(0),
-		ChainID:        big.NewInt(1),
-	})
-	txt.config(`^Byzantium/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(0),
-		EIP155Block:    big.NewInt(0),
-		EIP158Block:    big.NewInt(0),
-		ByzantiumBlock: big.NewInt(0),
-	})
+	// We don't allow more than uint64 in gas amount
+	// This is a pseudo-consensus vulnerability, but not in practice
+	// because of the gas limit
+	txt.skipLoad("^ttGasLimit/TransactionWithGasLimitxPriceOverflow.json")
+	// We _do_ allow more than uint64 in gas price, as opposed to the tests
+	// This is also not a concern, as long as tx.Cost() uses big.Int for
+	// calculating the final cost
+	txt.skipLoad("^ttGasPrice/TransactionWithGasPriceOverflow.json")
+
+	// The maximum value of nonce is 2^64 - 1
+	txt.skipLoad("^ttNonce/TransactionWithHighNonce64Minus1.json")
+
+	// The value is larger than uint64, which according to the test is invalid.
+	// Geth accepts it, which is not a consensus issue since we use big.Int's
+	// internally to calculate the cost
+	txt.skipLoad("^ttValue/TransactionWithHighValueOverflow.json")
+
+	// The size of a create tx's initcode is only checked during the state
+	// transition
+	txt.skipLoad("^ttEIP3860/DataTestInitCodeTooBig.json")
+
+	// The following tests require the tx precheck to be performed
+	// TODO(s1na): expose stateTransition.precheck publicly to be able to run these tests
+	txt.skipLoad("^ttEIP1559/maxPriorityFeePerGass32BytesValue.json")
+	txt.skipLoad("^ttEIP1559/maxPriorityFeePerGasOverflow.json")
+	txt.skipLoad("^ttEIP1559/maxFeePerGas32BytesValue.json")
+	txt.skipLoad("^ttEIP1559/maxFeePerGasOverflow.json")
+	txt.skipLoad("^ttEIP1559/GasLimitPriceProductPlusOneOverflow.json")
+	txt.skipLoad("^ttEIP1559/GasLimitPriceProductOverflow.json")
 
 	txt.walk(t, transactionTestDir, func(t *testing.T, name string, test *TransactionTest) {
-		cfg := txt.findConfig(name)
-		if err := txt.checkFailure(t, name, test.Run(cfg)); err != nil {
+		if err := txt.checkFailure(t, test.Run()); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func TestExecutionSpecTransaction(t *testing.T) {
+	if !common.FileExist(executionSpecStateTestDir) {
+		t.Skipf("directory %s does not exist", executionSpecStateTestDir)
+	}
+	st := new(testMatcher)
+
+	// Emptiness of authorization list is only validated during the tx precheck
+	st.skipLoad(`eip7702_set_code_tx/invalid_tx/empty_authorization_list\.json`)
+
+	st.walk(t, executionSpecTransactionTestDir, func(t *testing.T, name string, test *TransactionTest) {
+		if err := st.checkFailure(t, test.Run()); err != nil {
 			t.Error(err)
 		}
 	})

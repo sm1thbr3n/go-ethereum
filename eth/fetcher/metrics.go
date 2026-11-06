@@ -1,4 +1,4 @@
-// Copyright 2015 The go-ethereum Authors
+// Copyright 2025 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -12,32 +12,73 @@
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/
 
-// Contains the metrics collected by the fetcher.
+// Contains the metrics collected by the txfetcher.
 
 package fetcher
 
-import (
-	"github.com/ethereum/go-ethereum/metrics"
-)
+import "github.com/ethereum/go-ethereum/metrics"
 
 var (
-	propAnnounceInMeter   = metrics.NewRegisteredMeter("eth/fetcher/prop/announces/in", nil)
-	propAnnounceOutTimer  = metrics.NewRegisteredTimer("eth/fetcher/prop/announces/out", nil)
-	propAnnounceDropMeter = metrics.NewRegisteredMeter("eth/fetcher/prop/announces/drop", nil)
-	propAnnounceDOSMeter  = metrics.NewRegisteredMeter("eth/fetcher/prop/announces/dos", nil)
+	txAnnounceInMeter          = metrics.NewRegisteredMeter("eth/fetcher/transaction/announces/in", nil)
+	txAnnounceKnownMeter       = metrics.NewRegisteredMeter("eth/fetcher/transaction/announces/known", nil)
+	txAnnounceUnderpricedMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/announces/underpriced", nil)
+	txAnnounceOnchainMeter     = metrics.NewRegisteredMeter("eth/fetcher/transaction/announces/onchain", nil)
+	txAnnounceDOSMeter         = metrics.NewRegisteredMeter("eth/fetcher/transaction/announces/dos", nil)
 
-	propBroadcastInMeter   = metrics.NewRegisteredMeter("eth/fetcher/prop/broadcasts/in", nil)
-	propBroadcastOutTimer  = metrics.NewRegisteredTimer("eth/fetcher/prop/broadcasts/out", nil)
-	propBroadcastDropMeter = metrics.NewRegisteredMeter("eth/fetcher/prop/broadcasts/drop", nil)
-	propBroadcastDOSMeter  = metrics.NewRegisteredMeter("eth/fetcher/prop/broadcasts/dos", nil)
+	txBroadcastInMeter          = metrics.NewRegisteredMeter("eth/fetcher/transaction/broadcasts/in", nil)
+	txBroadcastKnownMeter       = metrics.NewRegisteredMeter("eth/fetcher/transaction/broadcasts/known", nil)
+	txBroadcastUnderpricedMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/broadcasts/underpriced", nil)
+	txBroadcastOtherRejectMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/broadcasts/otherreject", nil)
+	txBroadcastNoCapacityMeter  = metrics.NewRegisteredMeter("eth/fetcher/transaction/broadcasts/nocapacity", nil)
 
-	headerFetchMeter = metrics.NewRegisteredMeter("eth/fetcher/fetch/headers", nil)
-	bodyFetchMeter   = metrics.NewRegisteredMeter("eth/fetcher/fetch/bodies", nil)
+	txRequestOutMeter     = metrics.NewRegisteredMeter("eth/fetcher/transaction/request/out", nil)
+	txRequestFailMeter    = metrics.NewRegisteredMeter("eth/fetcher/transaction/request/fail", nil)
+	txRequestDoneMeter    = metrics.NewRegisteredMeter("eth/fetcher/transaction/request/done", nil)
+	txRequestTimeoutMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/request/timeout", nil)
 
-	headerFilterInMeter  = metrics.NewRegisteredMeter("eth/fetcher/filter/headers/in", nil)
-	headerFilterOutMeter = metrics.NewRegisteredMeter("eth/fetcher/filter/headers/out", nil)
-	bodyFilterInMeter    = metrics.NewRegisteredMeter("eth/fetcher/filter/bodies/in", nil)
-	bodyFilterOutMeter   = metrics.NewRegisteredMeter("eth/fetcher/filter/bodies/out", nil)
+	txReplyInMeter          = metrics.NewRegisteredMeter("eth/fetcher/transaction/replies/in", nil)
+	txReplyKnownMeter       = metrics.NewRegisteredMeter("eth/fetcher/transaction/replies/known", nil)
+	txReplyUnderpricedMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/replies/underpriced", nil)
+	txReplyOtherRejectMeter = metrics.NewRegisteredMeter("eth/fetcher/transaction/replies/otherreject", nil)
+	txReplyNoCapacityMeter  = metrics.NewRegisteredMeter("eth/fetcher/transaction/replies/nocapacity", nil)
+
+	txFetcherWaitingPeers   = metrics.NewRegisteredGauge("eth/fetcher/transaction/waiting/peers", nil)
+	txFetcherWaitingHashes  = metrics.NewRegisteredGauge("eth/fetcher/transaction/waiting/hashes", nil)
+	txFetcherQueueingPeers  = metrics.NewRegisteredGauge("eth/fetcher/transaction/queueing/peers", nil)
+	txFetcherQueueingHashes = metrics.NewRegisteredGauge("eth/fetcher/transaction/queueing/hashes", nil)
+	txFetcherFetchingPeers  = metrics.NewRegisteredGauge("eth/fetcher/transaction/fetching/peers", nil)
+	txFetcherFetchingHashes = metrics.NewRegisteredGauge("eth/fetcher/transaction/fetching/hashes", nil)
+
+	txFetcherSlowPeers = metrics.NewRegisteredGauge("eth/fetcher/transaction/slow/peers", nil)
+	// Note: this metric does not mean that the fetching of a transaction
+	// was blocked by a specific peer during this period, since we request
+	// another peer to fetch the same transaction hash.
+	// The purpose of this metric is to measure how long it takes for a slow peer
+	// to become "unfrozen", either by eventually replying to the request
+	// or by being dropped, measuring from the moment the request was sent.
+	txFetcherSlowWait = metrics.NewRegisteredHistogram("eth/fetcher/transaction/slow/wait", nil, metrics.NewExpDecaySample(1028, 0.015))
+
+	blobAnnounceInMeter  = metrics.NewRegisteredMeter("eth/fetcher/blob/announces/in", nil)
+	blobAnnounceDOSMeter = metrics.NewRegisteredMeter("eth/fetcher/blob/announces/dos", nil)
+	// This metric tracks partial→full conversions due to availability timeout
+	blobAnnounceTimeoutMeter = metrics.NewRegisteredMeter("eth/fetcher/blob/announces/timeout", nil)
+
+	blobRequestOutMeter     = metrics.NewRegisteredMeter("eth/fetcher/blob/request/out", nil)
+	blobRequestFailMeter    = metrics.NewRegisteredMeter("eth/fetcher/blob/request/fail", nil)
+	blobRequestDoneMeter    = metrics.NewRegisteredMeter("eth/fetcher/blob/request/done", nil)
+	blobRequestTimeoutMeter = metrics.NewRegisteredMeter("eth/fetcher/blob/request/timeout", nil)
+
+	blobReplyInMeter = metrics.NewRegisteredMeter("eth/fetcher/blob/replies/in", nil)
+
+	blobFetcherWaitingPeers   = metrics.NewRegisteredGauge("eth/fetcher/blob/waiting/peers", nil)
+	blobFetcherWaitingHashes  = metrics.NewRegisteredGauge("eth/fetcher/blob/waiting/hashes", nil)
+	blobFetcherQueueingPeers  = metrics.NewRegisteredGauge("eth/fetcher/blob/queueing/peers", nil)
+	blobFetcherQueueingHashes = metrics.NewRegisteredGauge("eth/fetcher/blob/queueing/hashes", nil)
+	blobFetcherFetchingPeers  = metrics.NewRegisteredGauge("eth/fetcher/blob/fetching/peers", nil)
+	blobFetcherFetchingHashes = metrics.NewRegisteredGauge("eth/fetcher/blob/fetching/hashes", nil)
+
+	blobFetcherWaitTime  = metrics.NewRegisteredHistogram("eth/fetcher/blob/wait/time", nil, metrics.NewExpDecaySample(1028, 0.015))
+	blobFetcherFetchTime = metrics.NewRegisteredHistogram("eth/fetcher/blob/fetch/time", nil, metrics.NewExpDecaySample(1028, 0.015))
 )

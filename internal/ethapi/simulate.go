@@ -1,0 +1,749 @@
+// Copyright 2023 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package ethapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"math/big"
+	"reflect"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/internal/ethapi/override"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rpc"
+)
+
+const (
+	// maxSimulateBlocks is the maximum number of blocks that can be simulated
+	// in a single request.
+	maxSimulateBlocks = 256
+
+	// maxSimulateCallsPerBlock is the maximum number of calls allowed in a
+	// single simulated block.
+	maxSimulateCallsPerBlock = 5000
+
+	// maxSimulateTotalCalls is the maximum total number of calls allowed
+	// across all simulated blocks in a single request.
+	maxSimulateTotalCalls = 10000
+
+	// timestampIncrement is the default increment between block timestamps.
+	timestampIncrement = 12
+)
+
+// simBlock is a batch of calls to be simulated sequentially.
+type simBlock struct {
+	BlockOverrides *override.BlockOverrides
+	StateOverrides *override.StateOverride
+	Calls          []TransactionArgs
+}
+
+// UnmarshalJSON rejects block and account override keys that are not defined.
+// encoding/json alone ignores unknown keys.
+func (b *simBlock) UnmarshalJSON(input []byte) error {
+	var dec struct {
+		BlockOverrides json.RawMessage
+		StateOverrides map[common.Address]json.RawMessage
+		Calls          []TransactionArgs
+	}
+	if err := json.Unmarshal(input, &dec); err != nil {
+		return err
+	}
+	var res simBlock
+	if dec.BlockOverrides != nil {
+		if err := checkOverrideKeys(dec.BlockOverrides, reflect.TypeFor[override.BlockOverrides](), "block override"); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(dec.BlockOverrides, &res.BlockOverrides); err != nil {
+			return err
+		}
+	}
+	if dec.StateOverrides != nil {
+		overrides := make(override.StateOverride, len(dec.StateOverrides))
+		for addr, raw := range dec.StateOverrides {
+			if err := checkOverrideKeys(raw, reflect.TypeFor[override.OverrideAccount](), "state override for "+addr.Hex()); err != nil {
+				return err
+			}
+			var account override.OverrideAccount
+			if err := json.Unmarshal(raw, &account); err != nil {
+				return err
+			}
+			overrides[addr] = account
+		}
+		res.StateOverrides = &overrides
+	}
+	res.Calls = dec.Calls
+	*b = res
+	return nil
+}
+
+// checkOverrideKeys returns an error for a key of the JSON object that does not
+// name a field of t, or that names a field another key already names. Names
+// match case-insensitively, as in encoding/json. Repeated identical keys cannot
+// be seen here; encoding/json keeps the last one.
+func checkOverrideKeys(input json.RawMessage, t reflect.Type, what string) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(input, &keys); err != nil || keys == nil {
+		return nil
+	}
+	seen := make(map[int]string)
+	for _, key := range slices.Sorted(maps.Keys(keys)) {
+		field := -1
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			if !f.IsExported() || name == "-" {
+				continue
+			}
+			if name == "" {
+				name = f.Name
+			}
+			if strings.EqualFold(key, name) {
+				field = i
+				break
+			}
+		}
+		if field < 0 {
+			return fmt.Errorf("unknown field %q in %s", key, what)
+		}
+		if prev, ok := seen[field]; ok {
+			return fmt.Errorf("keys %q and %q in %s name the same field", prev, key, what)
+		}
+		seen[field] = key
+	}
+	return nil
+}
+
+// simCallResult is the result of a simulated call.
+type simCallResult struct {
+	ReturnValue hexutil.Bytes  `json:"returnData"`
+	Logs        []*types.Log   `json:"logs"`
+	GasUsed     hexutil.Uint64 `json:"gasUsed"`
+	MaxUsedGas  hexutil.Uint64 `json:"maxUsedGas"`
+	Status      hexutil.Uint64 `json:"status"`
+	Error       *callError     `json:"error,omitempty"`
+}
+
+func (r *simCallResult) MarshalJSON() ([]byte, error) {
+	type callResultAlias simCallResult
+	// Marshal logs to be an empty array instead of nil when empty
+	if r.Logs == nil {
+		r.Logs = []*types.Log{}
+	}
+	return json.Marshal((*callResultAlias)(r))
+}
+
+// simBlockResult is the result of a simulated block.
+type simBlockResult struct {
+	fullTx      bool
+	chainConfig *params.ChainConfig
+	Block       *types.Block
+	Calls       []simCallResult
+	// senders is a map of transaction hashes to their senders.
+	senders map[common.Hash]common.Address
+}
+
+func (r *simBlockResult) MarshalJSON() ([]byte, error) {
+	blockData := RPCMarshalBlock(r.Block, true, r.fullTx, r.chainConfig)
+	blockData["calls"] = r.Calls
+	// Set tx sender if user requested full tx objects.
+	if r.fullTx {
+		if raw, ok := blockData["transactions"].([]any); ok {
+			for _, tx := range raw {
+				if tx, ok := tx.(*RPCTransaction); ok {
+					tx.From = r.senders[tx.Hash]
+				} else {
+					return nil, errors.New("simulated transaction result has invalid type")
+				}
+			}
+		}
+	}
+	return json.Marshal(blockData)
+}
+
+// simOpts are the inputs to eth_simulateV1.
+type simOpts struct {
+	BlockStateCalls        []simBlock
+	TraceTransfers         bool
+	Validation             bool
+	ReturnFullTransactions bool
+}
+
+// simChainHeadReader implements ChainHeaderReader which is needed as input for FinalizeAndAssemble.
+type simChainHeadReader struct {
+	context.Context
+	Backend
+}
+
+func (m *simChainHeadReader) Config() *params.ChainConfig {
+	return m.Backend.ChainConfig()
+}
+
+func (m *simChainHeadReader) CurrentHeader() *types.Header {
+	return m.Backend.CurrentHeader()
+}
+
+func (m *simChainHeadReader) GetHeader(hash common.Hash, number uint64) *types.Header {
+	header, err := m.Backend.HeaderByNumber(m.Context, rpc.BlockNumber(number))
+	if err != nil || header == nil {
+		return nil
+	}
+	if header.Hash() != hash {
+		return nil
+	}
+	return header
+}
+
+func (m *simChainHeadReader) GetHeaderByNumber(number uint64) *types.Header {
+	header, err := m.Backend.HeaderByNumber(m.Context, rpc.BlockNumber(number))
+	if err != nil {
+		return nil
+	}
+	return header
+}
+
+func (m *simChainHeadReader) GetHeaderByHash(hash common.Hash) *types.Header {
+	header, err := m.Backend.HeaderByHash(m.Context, hash)
+	if err != nil {
+		return nil
+	}
+	return header
+}
+
+// gasBudget tracks the remaining gas allowed across all simulated blocks.
+// It enforces the RPC-level gas cap to prevent DoS.
+type gasBudget struct {
+	remaining uint64
+}
+
+// newGasBudget creates a gas budget with the given cap.
+// A cap of 0 is treated as unlimited.
+func newGasBudget(cap uint64) *gasBudget {
+	if cap == 0 {
+		cap = math.MaxUint64
+	}
+	return &gasBudget{remaining: cap}
+}
+
+// cap returns the given gas value clamped to the remaining budget.
+func (b *gasBudget) cap(gas uint64) uint64 {
+	if gas > b.remaining {
+		return b.remaining
+	}
+	return gas
+}
+
+// consume deducts the given amount from the budget.
+// Returns an error if the amount exceeds the remaining budget.
+func (b *gasBudget) consume(amount uint64) error {
+	if amount > b.remaining {
+		return fmt.Errorf("RPC gas cap exhausted: need %d, remaining %d", amount, b.remaining)
+	}
+	b.remaining -= amount
+	return nil
+}
+
+// simulator is a stateful object that simulates a series of blocks.
+// it is not safe for concurrent use.
+type simulator struct {
+	b              Backend
+	state          *state.StateDB
+	base           *types.Header
+	chainConfig    *params.ChainConfig
+	budget         *gasBudget
+	traceTransfers bool
+	validate       bool
+	fullTx         bool
+}
+
+// execute runs the simulation of a series of blocks.
+func (sim *simulator) execute(ctx context.Context, blocks []simBlock) ([]*simBlockResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var (
+		cancel  context.CancelFunc
+		timeout = sim.b.RPCEVMTimeout()
+	)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	var err error
+	blocks, err = sim.sanitizeChain(blocks)
+	if err != nil {
+		return nil, err
+	}
+	// Prepare block headers with preliminary fields for the response.
+	headers, err := sim.makeHeaders(blocks)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		results = make([]*simBlockResult, len(blocks))
+		parent  = sim.base
+	)
+	for bi, block := range blocks {
+		result, callResults, senders, err := sim.processBlock(ctx, &block, headers[bi], parent, headers[:bi], timeout)
+		if err != nil {
+			return nil, err
+		}
+		headers[bi] = result.Header()
+		results[bi] = &simBlockResult{
+			fullTx:      sim.fullTx,
+			chainConfig: sim.chainConfig,
+			Block:       result,
+			Calls:       callResults,
+			senders:     senders,
+		}
+		parent = result.Header()
+	}
+	return results, nil
+}
+
+func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header, parent *types.Header, headers []*types.Header, timeout time.Duration) (*types.Block, []simCallResult, map[common.Hash]common.Address, error) {
+	// Set header fields that depend only on parent block.
+	// Parent hash is needed for evm.GetHashFn to work.
+	header.ParentHash = parent.Hash()
+	if sim.chainConfig.IsLondon(header.Number) {
+		// In non-validation mode base fee is set to 0 if it is not overridden.
+		// This is because it creates an edge case in EVM where gasPrice < baseFee.
+		// Base fee could have been overridden.
+		if header.BaseFee == nil {
+			if sim.validate {
+				header.BaseFee = eip1559.CalcBaseFee(sim.chainConfig, parent)
+			} else {
+				header.BaseFee = big.NewInt(0)
+			}
+		}
+	}
+	if sim.chainConfig.IsCancun(header.Number, header.Time) {
+		var excess uint64
+		if sim.chainConfig.IsCancun(parent.Number, parent.Time) {
+			excess = eip4844.CalcExcessBlobGas(sim.chainConfig, parent, header.Time)
+		}
+		header.ExcessBlobGas = &excess
+	}
+	blockContext := core.NewEVMBlockContext(header, sim.newSimulatedChainContext(ctx, headers), nil)
+	if block.BlockOverrides.BlobBaseFee != nil {
+		blockContext.BlobBaseFee = block.BlockOverrides.BlobBaseFee.ToInt()
+	}
+	precompiles := sim.activePrecompiles(header)
+
+	// State overrides are applied prior to execution of a block
+	if err := block.StateOverrides.Apply(sim.state, precompiles); err != nil {
+		return nil, nil, nil, err
+	}
+	var (
+		gp          = core.NewGasPool(blockContext.GasLimit)
+		blobGasUsed uint64
+
+		txes            = make([]*types.Transaction, len(block.Calls))
+		callResults     = make([]simCallResult, len(block.Calls))
+		receipts        = make([]*types.Receipt, len(block.Calls))
+		blockAccessList = bal.NewConstructionBlockAccessList()
+
+		// Post-Amsterdam the protocol emits an EIP-7708 transfer log for every
+		// ether transfer, so synthesizing them would report each transfer twice.
+		traceTransfers = sim.traceTransfers && !sim.chainConfig.IsAmsterdam(header.Number, header.Time)
+
+		// Block hash will be repaired after execution.
+		tracer   = newTracer(traceTransfers, blockContext.BlockNumber.Uint64(), blockContext.Time, common.Hash{}, common.Hash{}, 0)
+		vmConfig = &vm.Config{
+			NoBaseFee: !sim.validate,
+			Tracer:    tracer.Hooks(),
+		}
+		// senders is a map of transaction hashes to their senders.
+		// Transaction objects contain only the signature, and we lose track
+		// of the sender when translating the arguments into a transaction object.
+		senders = make(map[common.Hash]common.Address)
+	)
+	tracingStateDB := vm.StateDB(sim.state)
+	if hooks := tracer.Hooks(); hooks != nil {
+		tracingStateDB = state.NewHookedState(sim.state, hooks)
+	}
+	evm := vm.NewEVM(blockContext, tracingStateDB, sim.chainConfig, *vmConfig)
+	defer evm.Release()
+
+	// It is possible to override precompiles with EVM bytecode, or
+	// move them to another address.
+	if precompiles != nil {
+		evm.SetPrecompiles(precompiles)
+	}
+	// Run pre-execution system calls
+	blockAccessList.Merge(core.PreExecution(ctx, header.ParentBeaconRoot, parent, sim.chainConfig, evm, header.Number, header.Time))
+
+	var allLogs []*types.Log
+	for i, call := range block.Calls {
+		// Terminate if the context is cancelled
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		gasCapped, err := sim.sanitizeCall(&call, sim.state, header, gp)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		// EIP-2681 also limits the nonce when validation is off and the nonce checks are skipped.
+		if !sim.validate {
+			if from := call.from(); sim.state.GetNonce(from) == math.MaxUint64 {
+				return nil, nil, nil, txValidationError(fmt.Errorf("%w: address %v, nonce: %d", core.ErrNonceMax, from.Hex(), uint64(math.MaxUint64)))
+			}
+		}
+		var (
+			tx     = call.ToTransaction(types.DynamicFeeTxType)
+			txHash = tx.Hash()
+		)
+		txes[i] = tx
+		senders[txHash] = call.from()
+		tracer.reset(txHash, uint(i))
+
+		// EoA check is always skipped, even in validation mode.
+		sim.state.SetTxContext(txHash, i, uint32(i+1))
+		msg := call.ToMessage(header.BaseFee, !sim.validate)
+		if !sim.validate {
+			msg.SkipExecutionGasCapCheck()
+		}
+		result, err := applyMessageWithEVM(ctx, evm, msg, timeout, gp)
+		if err != nil {
+			txErr := txValidationError(err)
+			return nil, nil, nil, txErr
+		}
+		// Update the state with pending changes.
+		var root []byte
+		if sim.chainConfig.IsByzantium(blockContext.BlockNumber) {
+			blockAccessList.Merge(tracingStateDB.Finalise(evm.GetRules()))
+		} else {
+			root = sim.state.IntermediateRoot(evm.GetRules()).Bytes()
+		}
+		receipts[i] = core.MakeReceipt(evm, result, sim.state, blockContext.BlockNumber, common.Hash{}, blockContext.Time, tx, gp.CumulativeUsed(), root)
+		blobGasUsed += receipts[i].BlobGasUsed
+
+		// Make sure the gas cap is still enforced. It's only for
+		// internally protection.
+		if err := sim.budget.consume(result.UsedGas); err != nil {
+			return nil, nil, nil, err
+		}
+
+		logs := tracer.Logs()
+		callRes := simCallResult{ReturnValue: result.Return(), Logs: logs, GasUsed: hexutil.Uint64(result.UsedGas), MaxUsedGas: hexutil.Uint64(result.MaxUsedGas)}
+		if result.Failed() {
+			callRes.Status = hexutil.Uint64(types.ReceiptStatusFailed)
+			if errors.Is(result.Err, vm.ErrExecutionReverted) {
+				// If the result contains a revert reason, try to unpack it.
+				revertErr := newRevertError(result.Revert())
+				callRes.Error = &callError{Message: revertErr.Error(), Code: revertErr.ErrorCode(), Data: revertErr.ErrorData().(string)}
+			} else {
+				msg := result.Err.Error()
+				if gasCapped {
+					msg += " (gas limit was capped by the RPC server's global gas cap)"
+				}
+				callRes.Error = &callError{Message: msg, Code: ErrCodeVMError}
+			}
+		} else {
+			callRes.Status = hexutil.Uint64(types.ReceiptStatusSuccessful)
+			allLogs = append(allLogs, callRes.Logs...)
+		}
+		callResults[i] = callRes
+	}
+	// Assign total consumed gas to the header
+	header.GasUsed = gp.Used()
+	if sim.chainConfig.IsCancun(header.Number, header.Time) {
+		header.BlobGasUsed = &blobGasUsed
+	}
+
+	blockBody := &types.Body{
+		Transactions: txes,
+	}
+	// Withdrawals are a post-Shanghai field. Attaching a non-nil withdrawals
+	// slice would cause types.NewBlock to populate WithdrawalsHash on the
+	// header and emit withdrawals fields for pre-Shanghai blocks.
+	if sim.chainConfig.IsShanghai(header.Number, header.Time) {
+		blockBody.Withdrawals = *block.BlockOverrides.Withdrawals
+	}
+	// Process the withdrawals and EIP-7685 requests
+	requests, bal, err := core.PostExecution(ctx, sim.chainConfig, header.Number, header.Time, allLogs, blockBody.Withdrawals, evm, uint32(len(block.Calls)+1))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if requests != nil {
+		reqHash := types.CalcRequestsHash(requests)
+		header.RequestsHash = &reqHash
+	}
+	blockAccessList.Merge(bal)
+	chainHeadReader := &simChainHeadReader{ctx, sim.b}
+
+	// Apply the consensus-specific post-transaction changes
+	sim.b.Engine().Finalize(chainHeadReader, header, sim.state, blockBody)
+
+	// Assemble the block
+	b := core.AssembleBlock(chainHeadReader, header, sim.state, blockBody, receipts, blockAccessList)
+
+	repairLogs(callResults, b.Hash())
+	return b, callResults, senders, nil
+}
+
+// repairLogs updates the block hash in the logs present in the result of
+// a simulated block. This is needed as during execution when logs are collected
+// the block hash is not known.
+func repairLogs(calls []simCallResult, hash common.Hash) {
+	for i := range calls {
+		for j := range calls[i].Logs {
+			calls[i].Logs[j].BlockHash = hash
+		}
+	}
+}
+
+func (sim *simulator) sanitizeCall(call *TransactionArgs, state vm.StateDB, header *types.Header, gp *core.GasPool) (bool, error) {
+	if call.Nonce == nil {
+		nonce := state.GetNonce(call.from())
+		call.Nonce = (*hexutil.Uint64)(&nonce)
+	}
+	// Let the call run wild unless explicitly specified.
+	amsterdam := sim.chainConfig.IsAmsterdam(header.Number, header.Time)
+	remaining := gp.Available(amsterdam)
+	if amsterdam && !sim.validate {
+		// The execution gas is not capped in non-strict mode (see processBlock),
+		// so the whole gas limit is reserved in the execution dimension too.
+		remaining = min(remaining, header.GasLimit-gp.CumulativeExecution())
+	}
+	if call.Gas == nil {
+		call.Gas = (*hexutil.Uint64)(&remaining)
+	}
+	if remaining < uint64(*call.Gas) {
+		return false, &blockGasLimitReachedError{fmt.Sprintf("block gas limit reached: remaining: %d, required: %d", remaining, *call.Gas)}
+	}
+	// Clamp to the cross-block gas budget.
+	gas := sim.budget.cap(uint64(*call.Gas))
+	gasCapped := gas < uint64(*call.Gas)
+	call.Gas = (*hexutil.Uint64)(&gas)
+
+	return gasCapped, call.CallDefaults(0, header.BaseFee, sim.chainConfig.ChainID)
+}
+
+func (sim *simulator) activePrecompiles(base *types.Header) vm.PrecompiledContracts {
+	var (
+		isMerge = (base.Difficulty.Sign() == 0)
+		rules   = sim.chainConfig.Rules(base.Number, isMerge, base.Time)
+	)
+	return vm.ActivePrecompiledContracts(rules)
+}
+
+// sanitizeChain checks the chain integrity. Specifically it checks that
+// block numbers and timestamp are strictly increasing, setting default values
+// when necessary. Gaps in block numbers are filled with empty blocks.
+// Note: It modifies the block's override object.
+func (sim *simulator) sanitizeChain(blocks []simBlock) ([]simBlock, error) {
+	var (
+		res           = make([]simBlock, 0, len(blocks))
+		base          = sim.base
+		prevNumber    = base.Number
+		prevTimestamp = base.Time
+	)
+	for _, block := range blocks {
+		if block.BlockOverrides == nil {
+			block.BlockOverrides = new(override.BlockOverrides)
+		}
+		if block.BlockOverrides.Number == nil {
+			n := new(big.Int).Add(prevNumber, big.NewInt(1))
+			block.BlockOverrides.Number = (*hexutil.Big)(n)
+		}
+		if block.BlockOverrides.Withdrawals == nil {
+			block.BlockOverrides.Withdrawals = &types.Withdrawals{}
+		}
+		diff := new(big.Int).Sub(block.BlockOverrides.Number.ToInt(), prevNumber)
+		if diff.Cmp(common.Big0) <= 0 {
+			return nil, &invalidBlockNumberError{fmt.Sprintf("block numbers must be in order: %d <= %d", block.BlockOverrides.Number.ToInt().Uint64(), prevNumber)}
+		}
+		if total := new(big.Int).Sub(block.BlockOverrides.Number.ToInt(), base.Number); total.Cmp(big.NewInt(maxSimulateBlocks)) > 0 {
+			return nil, &clientLimitExceededError{message: "too many blocks"}
+		}
+		if diff.Cmp(big.NewInt(1)) > 0 {
+			// Fill the gap with empty blocks.
+			gap := new(big.Int).Sub(diff, big.NewInt(1))
+			// Assign block number to the empty blocks.
+			for i := uint64(0); i < gap.Uint64(); i++ {
+				n := new(big.Int).Add(prevNumber, big.NewInt(int64(i+1)))
+				t := prevTimestamp + timestampIncrement
+				b := simBlock{
+					BlockOverrides: &override.BlockOverrides{
+						Number:      (*hexutil.Big)(n),
+						Time:        (*hexutil.Uint64)(&t),
+						Withdrawals: &types.Withdrawals{},
+					},
+				}
+				prevTimestamp = t
+				res = append(res, b)
+			}
+		}
+		// Only append block after filling a potential gap.
+		prevNumber = block.BlockOverrides.Number.ToInt()
+		var t uint64
+		if block.BlockOverrides.Time == nil {
+			t = prevTimestamp + timestampIncrement
+			block.BlockOverrides.Time = (*hexutil.Uint64)(&t)
+		} else {
+			t = uint64(*block.BlockOverrides.Time)
+			if t <= prevTimestamp {
+				return nil, &invalidBlockTimestampError{fmt.Sprintf("block timestamps must be in order: %d <= %d", t, prevTimestamp)}
+			}
+		}
+		prevTimestamp = t
+		res = append(res, block)
+	}
+	return res, nil
+}
+
+// makeHeaders makes header object with preliminary fields based on a simulated block.
+// Some fields have to be filled post-execution.
+// It assumes blocks are in order and numbers have been validated.
+func (sim *simulator) makeHeaders(blocks []simBlock) ([]*types.Header, error) {
+	var (
+		res    = make([]*types.Header, len(blocks))
+		base   = sim.base
+		header = base
+	)
+	for bi, block := range blocks {
+		if block.BlockOverrides == nil || block.BlockOverrides.Number == nil {
+			return nil, errors.New("empty block number")
+		}
+		overrides := block.BlockOverrides
+
+		number := overrides.Number.ToInt()
+		timestamp := (uint64)(*overrides.Time)
+
+		var withdrawalsHash *common.Hash
+		if sim.chainConfig.IsShanghai(number, timestamp) {
+			withdrawalsHash = &types.EmptyWithdrawalsHash
+		}
+
+		var parentBeaconRoot *common.Hash
+		if sim.chainConfig.IsCancun(number, timestamp) {
+			parentBeaconRoot = &common.Hash{}
+			if overrides.BeaconRoot != nil {
+				parentBeaconRoot = overrides.BeaconRoot
+			}
+		}
+		// Set difficulty to zero if the given block is post-merge. Without this, all post-merge hardforks would remain inactive.
+		// For example, calling eth_simulateV1(..., blockParameter: 0x0) on hoodi network will cause all blocks to have a difficulty of 1 and be treated as pre-merge.
+		difficulty := header.Difficulty
+		if sim.chainConfig.IsPostMerge(number.Uint64(), timestamp) {
+			difficulty = big.NewInt(0)
+		}
+		if overrides.Difficulty != nil && difficulty.Sign() == 0 {
+			return nil, &invalidParamsError{fmt.Sprintf("block %d: difficulty override is not allowed after the merge", number)}
+		}
+		// The slot number is unknown when the parent has none, so it is omitted then.
+		var slotNumber *uint64
+		if header.SlotNumber != nil {
+			slot := *header.SlotNumber + 1
+			slotNumber = &slot
+		}
+		header = overrides.MakeHeader(&types.Header{
+			UncleHash:        types.EmptyUncleHash,
+			ReceiptHash:      types.EmptyReceiptsHash,
+			TxHash:           types.EmptyTxsHash,
+			Coinbase:         header.Coinbase,
+			Difficulty:       difficulty,
+			GasLimit:         header.GasLimit,
+			WithdrawalsHash:  withdrawalsHash,
+			ParentBeaconRoot: parentBeaconRoot,
+			SlotNumber:       slotNumber,
+		})
+		res[bi] = header
+	}
+	return res, nil
+}
+
+func (sim *simulator) newSimulatedChainContext(ctx context.Context, headers []*types.Header) *ChainContext {
+	return NewChainContext(ctx, &simBackend{
+		base:    sim.base,
+		b:       sim.b,
+		headers: headers,
+	})
+}
+
+type simBackend struct {
+	b       ChainContextBackend
+	base    *types.Header
+	headers []*types.Header
+}
+
+func (b *simBackend) Engine() consensus.Engine {
+	return b.b.Engine()
+}
+
+func (b *simBackend) HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error) {
+	if uint64(number) == b.base.Number.Uint64() {
+		return b.base, nil
+	}
+	if uint64(number) < b.base.Number.Uint64() {
+		// Resolve canonical header.
+		return b.b.HeaderByNumber(ctx, number)
+	}
+	// Simulated block.
+	for _, header := range b.headers {
+		if header.Number.Uint64() == uint64(number) {
+			return header, nil
+		}
+	}
+	return nil, errors.New("header not found")
+}
+
+func (b *simBackend) ChainConfig() *params.ChainConfig {
+	return b.b.ChainConfig()
+}
+
+func (b *simBackend) HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error) {
+	if b.base.Hash() == hash {
+		return b.base, nil
+	}
+	if header, err := b.b.HeaderByHash(ctx, hash); err == nil {
+		return header, nil
+	}
+	// Check simulated headers
+	for _, header := range b.headers {
+		if header.Hash() == hash {
+			return header, nil
+		}
+	}
+	return nil, errors.New("header not found")
+}
+
+func (b *simBackend) CurrentHeader() *types.Header {
+	return b.b.CurrentHeader()
+}

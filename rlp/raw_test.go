@@ -18,10 +18,307 @@ package rlp
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"testing"
+	"testing/quick"
 )
+
+type rawListTest[T any] struct {
+	input   string
+	content string
+	items   []T
+	length  int
+}
+
+func (test rawListTest[T]) name() string {
+	return fmt.Sprintf("%T-%d", *new(T), test.length)
+}
+
+func (test rawListTest[T]) run(t *testing.T) {
+	// check decoding and properties
+	input := unhex(test.input)
+	inputSize := len(input)
+	var rl RawList[T]
+	if err := DecodeBytes(input, &rl); err != nil {
+		t.Fatal("decode failed:", err)
+	}
+	if l := rl.Len(); l != test.length {
+		t.Fatalf("wrong Len %d, want %d", l, test.length)
+	}
+	if sz := rl.Size(); sz != uint64(inputSize) {
+		t.Fatalf("wrong Size %d, want %d", sz, inputSize)
+	}
+	items, err := rl.Items()
+	if err != nil {
+		t.Fatal("Items failed:", err)
+	}
+	if !reflect.DeepEqual(items, test.items) {
+		t.Fatal("wrong items:", items)
+	}
+	if !bytes.Equal(rl.Content(), unhex(test.content)) {
+		t.Fatalf("wrong Content %x, want %s", rl.Content(), test.content)
+	}
+	if !bytes.Equal(rl.Bytes(), unhex(test.input)) {
+		t.Fatalf("wrong Bytes %x, want %s", rl.Bytes(), test.input)
+	}
+
+	// check iterator
+	it := rl.ContentIterator()
+	i := 0
+	for it.Next() {
+		var item T
+		if err := DecodeBytes(it.Value(), &item); err != nil {
+			t.Fatalf("item %d decode error: %v", i, err)
+		}
+		if !reflect.DeepEqual(item, items[i]) {
+			t.Fatalf("iterator has wrong item %v at %d", item, i)
+		}
+		i++
+	}
+	if i != test.length {
+		t.Fatalf("iterator produced %d values, want %d", i, test.length)
+	}
+	if it.Err() != nil {
+		t.Fatalf("iterator error: %v", it.Err())
+	}
+
+	// check encoding round trip
+	output, err := EncodeToBytes(&rl)
+	if err != nil {
+		t.Fatal("encode error:", err)
+	}
+	if !bytes.Equal(output, unhex(test.input)) {
+		t.Fatalf("encoding does not round trip: %x", output)
+	}
+
+	// check EncodeToRawList on items produces same bytes
+	encRL, err := EncodeToRawList(test.items)
+	if err != nil {
+		t.Fatal("EncodeToRawList error:", err)
+	}
+	encRLOutput, err := EncodeToBytes(&encRL)
+	if err != nil {
+		t.Fatal("EncodeToBytes of encoded list failed:", err)
+	}
+	if !bytes.Equal(encRLOutput, output) {
+		t.Fatalf("wrong encoding of EncodeToRawList result: %x", encRLOutput)
+	}
+}
+
+func TestRawList(t *testing.T) {
+	tests := []interface {
+		name() string
+		run(t *testing.T)
+	}{
+		rawListTest[uint64]{
+			input:   "C0",
+			content: "",
+			items:   []uint64{},
+			length:  0,
+		},
+		rawListTest[uint64]{
+			input:   "C3010203",
+			content: "010203",
+			items:   []uint64{1, 2, 3},
+			length:  3,
+		},
+		rawListTest[simplestruct]{
+			input:   "C6C20102C20304",
+			content: "C20102C20304",
+			items:   []simplestruct{{1, "\x02"}, {3, "\x04"}},
+			length:  2,
+		},
+		rawListTest[string]{
+			input:   "F83C836161618362626283636363836464648365656583666666836767678368686883696969836A6A6A836B6B6B836C6C6C836D6D6D836E6E6E836F6F6F",
+			content: "836161618362626283636363836464648365656583666666836767678368686883696969836A6A6A836B6B6B836C6C6C836D6D6D836E6E6E836F6F6F",
+			items:   []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo"},
+			length:  15,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name(), test.run)
+	}
+}
+
+func TestRawListEmpty(t *testing.T) {
+	// zero value list
+	var rl RawList[uint64]
+	b, _ := EncodeToBytes(&rl)
+	if !bytes.Equal(b, unhex("C0")) {
+		t.Fatalf("empty RawList has wrong encoding %x", b)
+	}
+	if rl.Len() != 0 {
+		t.Fatalf("empty list has Len %d", rl.Len())
+	}
+	if rl.Size() != 1 {
+		t.Fatalf("empty list has Size %d", rl.Size())
+	}
+	if len(rl.Content()) > 0 {
+		t.Fatalf("empty list has non-empty Content")
+	}
+	if !bytes.Equal(rl.Bytes(), []byte{0xC0}) {
+		t.Fatalf("empty list has wrong encoding")
+	}
+
+	// nil pointer
+	var nilptr *RawList[uint64]
+	b, _ = EncodeToBytes(nilptr)
+	if !bytes.Equal(b, unhex("C0")) {
+		t.Fatalf("nil pointer to RawList has wrong encoding %x", b)
+	}
+}
+
+// This checks that *RawList works in an 'optional' context.
+func TestRawListOptional(t *testing.T) {
+	type foo struct {
+		L *RawList[uint64] `rlp:"optional"`
+	}
+	// nil pointer encoding
+	var empty foo
+	b, _ := EncodeToBytes(empty)
+	if !bytes.Equal(b, unhex("C0")) {
+		t.Fatalf("nil pointer to RawList has wrong encoding %x", b)
+	}
+	// decoding
+	var dec foo
+	if err := DecodeBytes(unhex("C0"), &dec); err != nil {
+		t.Fatal(err)
+	}
+	if dec.L != nil {
+		t.Fatal("rawlist was decoded as non-nil")
+	}
+}
+
+func TestRawListAppend(t *testing.T) {
+	var rl RawList[simplestruct]
+
+	v1 := simplestruct{1, "one"}
+	v2 := simplestruct{2, "two"}
+	if err := rl.Append(v1); err != nil {
+		t.Fatal("append 1 failed:", err)
+	}
+	if err := rl.Append(v2); err != nil {
+		t.Fatal("append 2 failed:", err)
+	}
+
+	if rl.Len() != 2 {
+		t.Fatalf("wrong Len %d", rl.Len())
+	}
+	if rl.Size() != 13 {
+		t.Fatalf("wrong Size %d", rl.Size())
+	}
+	if !bytes.Equal(rl.Content(), unhex("C501836F6E65 C5028374776F")) {
+		t.Fatalf("wrong Content %x", rl.Content())
+	}
+	encoded, _ := EncodeToBytes(&rl)
+	if !bytes.Equal(encoded, unhex("CC C501836F6E65 C5028374776F")) {
+		t.Fatalf("wrong encoding %x", encoded)
+	}
+}
+
+func TestRawListAppendRaw(t *testing.T) {
+	var rl RawList[uint64]
+
+	if err := rl.AppendRaw(unhex("01")); err != nil {
+		t.Fatal("AppendRaw(01) failed:", err)
+	}
+	if err := rl.AppendRaw(unhex("820102")); err != nil {
+		t.Fatal("AppendRaw(820102) failed:", err)
+	}
+	if rl.Len() != 2 {
+		t.Fatalf("wrong Len %d after valid appends", rl.Len())
+	}
+
+	if err := rl.AppendRaw(nil); err == nil {
+		t.Fatal("AppendRaw(nil) should fail")
+	}
+	if err := rl.AppendRaw(unhex("0102")); err == nil {
+		t.Fatal("AppendRaw(0102) should fail due to trailing bytes")
+	}
+	if err := rl.AppendRaw(unhex("8201")); err == nil {
+		t.Fatal("AppendRaw(8201) should fail due to truncated value")
+	}
+	if rl.Len() != 2 {
+		t.Fatalf("wrong Len %d after invalid appends, want 2", rl.Len())
+	}
+}
+func TestRawListAppendList(t *testing.T) {
+	var rl1 RawList[uint64]
+	if err := rl1.Append(uint64(1)); err != nil {
+		t.Fatal("append 1 failed:", err)
+	}
+	if err := rl1.Append(uint64(2)); err != nil {
+		t.Fatal("append 2 failed:", err)
+	}
+
+	var rl2 RawList[uint64]
+	if err := rl2.Append(uint64(3)); err != nil {
+		t.Fatal("append 3 failed:", err)
+	}
+	if err := rl2.Append(uint64(4)); err != nil {
+		t.Fatal("append 4 failed:", err)
+	}
+
+	rl1.AppendList(&rl2)
+
+	if rl1.Len() != 4 {
+		t.Fatalf("wrong Len %d, want 4", rl1.Len())
+	}
+	if rl1.Size() != 5 {
+		t.Fatalf("wrong Size %d, want 5", rl1.Size())
+	}
+
+	items, err := rl1.Items()
+	if err != nil {
+		t.Fatal("Items failed:", err)
+	}
+	if !reflect.DeepEqual(items, []uint64{1, 2, 3, 4}) {
+		t.Fatalf("wrong items: %v", items)
+	}
+
+	var empty RawList[uint64]
+	prevLen := rl1.Len()
+	rl1.AppendList(&empty)
+
+	if rl1.Len() != prevLen {
+		t.Fatalf("appending empty list changed Len: got %d, want %d", rl1.Len(), prevLen)
+	}
+
+	empty.AppendList(&rl1)
+
+	if empty.Len() != 4 {
+		t.Fatalf("wrong Len %d, want 4", empty.Len())
+	}
+}
+
+func TestRawListDecodeInvalid(t *testing.T) {
+	tests := []struct {
+		input string
+		err   error
+	}{
+		// Single item with non-canonical size (0x81 wrapping byte <= 0x7F).
+		{input: "C28142", err: ErrCanonSize},
+		// Single item claiming more bytes than available in the list.
+		{input: "C484020202", err: ErrElemTooLarge},
+		// Two items, second has non-canonical size.
+		{input: "C3018142", err: ErrCanonSize},
+		// Two items, second claims more bytes than remain in the list.
+		{input: "C401830202", err: ErrElemTooLarge},
+		// Item is a sub-list whose declared size exceeds available bytes.
+		{input: "C3C40102", err: ErrElemTooLarge},
+	}
+	for _, test := range tests {
+		var rl RawList[RawValue]
+		err := DecodeBytes(unhex(test.input), &rl)
+		if !errors.Is(err, test.err) {
+			t.Errorf("input %s: error mismatch: got %v, want %v", test.input, err, test.err)
+		}
+	}
+}
 
 func TestCountValues(t *testing.T) {
 	tests := []struct {
@@ -39,9 +336,9 @@ func TestCountValues(t *testing.T) {
 		{"820101 820202 8403030303 04", 4, nil},
 
 		// size errors
-		{"8142", 0, ErrCanonSize},
-		{"01 01 8142", 0, ErrCanonSize},
-		{"02 84020202", 0, ErrValueTooLarge},
+		{"8142", 1, ErrCanonSize},
+		{"01 01 8142", 3, ErrCanonSize},
+		{"02 84020202", 2, ErrValueTooLarge},
 
 		{
 			input: "A12000BF49F440A1CD0527E4D06E2765654C0F56452257516D793A9B8D604DCFDF2AB853F851808D10000000000000000000000000A056E81F171BCC55A6FF8345E692C0F86E5B48E01B996CADC001622FB5E363B421A0C5D2460186F7233C927E7DB2DCC703C0E500B653CA82273B7BFAD8045D85A470",
@@ -53,21 +350,84 @@ func TestCountValues(t *testing.T) {
 		if count != test.count {
 			t.Errorf("test %d: count mismatch, got %d want %d\ninput: %s", i, count, test.count, test.input)
 		}
-		if !reflect.DeepEqual(err, test.err) {
+		if !errors.Is(err, test.err) {
 			t.Errorf("test %d: err mismatch, got %q want %q\ninput: %s", i, err, test.err, test.input)
 		}
 	}
 }
 
-func TestSplitTypes(t *testing.T) {
-	if _, _, err := SplitString(unhex("C100")); err != ErrExpectedString {
-		t.Errorf("SplitString returned %q, want %q", err, ErrExpectedString)
+func TestSplitString(t *testing.T) {
+	for i, test := range []string{
+		"C0",
+		"C100",
+		"C3010203",
+		"C88363617483646F67",
+		"F8384C6F72656D20697073756D20646F6C6F722073697420616D65742C20636F6E7365637465747572206164697069736963696E6720656C6974",
+	} {
+		if _, _, err := SplitString(unhex(test)); !errors.Is(err, ErrExpectedString) {
+			t.Errorf("test %d: error mismatch: have %q, want %q", i, err, ErrExpectedString)
+		}
 	}
-	if _, _, err := SplitList(unhex("01")); err != ErrExpectedList {
-		t.Errorf("SplitString returned %q, want %q", err, ErrExpectedList)
+}
+
+func TestSplitList(t *testing.T) {
+	for i, test := range []string{
+		"80",
+		"00",
+		"01",
+		"8180",
+		"81FF",
+		"820400",
+		"83636174",
+		"83646F67",
+		"B8384C6F72656D20697073756D20646F6C6F722073697420616D65742C20636F6E7365637465747572206164697069736963696E6720656C6974",
+	} {
+		if _, _, err := SplitList(unhex(test)); !errors.Is(err, ErrExpectedList) {
+			t.Errorf("test %d: error mismatch: have %q, want %q", i, err, ErrExpectedList)
+		}
 	}
-	if _, _, err := SplitList(unhex("81FF")); err != ErrExpectedList {
-		t.Errorf("SplitString returned %q, want %q", err, ErrExpectedList)
+}
+
+func TestSplitUint64(t *testing.T) {
+	tests := []struct {
+		input string
+		val   uint64
+		rest  string
+		err   error
+	}{
+		{"01", 1, "", nil},
+		{"7FFF", 0x7F, "FF", nil},
+		{"80FF", 0, "FF", nil},
+		{"81FAFF", 0xFA, "FF", nil},
+		{"82FAFAFF", 0xFAFA, "FF", nil},
+		{"83FAFAFAFF", 0xFAFAFA, "FF", nil},
+		{"84FAFAFAFAFF", 0xFAFAFAFA, "FF", nil},
+		{"85FAFAFAFAFAFF", 0xFAFAFAFAFA, "FF", nil},
+		{"86FAFAFAFAFAFAFF", 0xFAFAFAFAFAFA, "FF", nil},
+		{"87FAFAFAFAFAFAFAFF", 0xFAFAFAFAFAFAFA, "FF", nil},
+		{"88FAFAFAFAFAFAFAFAFF", 0xFAFAFAFAFAFAFAFA, "FF", nil},
+
+		// errors
+		{"", 0, "", io.ErrUnexpectedEOF},
+		{"00", 0, "00", ErrCanonInt},
+		{"81", 0, "81", ErrValueTooLarge},
+		{"8100", 0, "8100", ErrCanonSize},
+		{"8200FF", 0, "8200FF", ErrCanonInt},
+		{"8103FF", 0, "8103FF", ErrCanonSize},
+		{"89FAFAFAFAFAFAFAFAFAFF", 0, "89FAFAFAFAFAFAFAFAFAFF", errUintOverflow},
+	}
+
+	for i, test := range tests {
+		val, rest, err := SplitUint64(unhex(test.input))
+		if val != test.val {
+			t.Errorf("test %d: val mismatch: got %x, want %x (input %q)", i, val, test.val, test.input)
+		}
+		if !bytes.Equal(rest, unhex(test.rest)) {
+			t.Errorf("test %d: rest mismatch: got %x, want %s (input %q)", i, rest, test.rest, test.input)
+		}
+		if err != test.err {
+			t.Errorf("test %d: error mismatch: got %q, want %q", i, err, test.err)
+		}
 	}
 }
 
@@ -78,7 +438,9 @@ func TestSplit(t *testing.T) {
 		val, rest string
 		err       error
 	}{
+		{input: "00FFFF", kind: Byte, val: "00", rest: "FFFF"},
 		{input: "01FFFF", kind: Byte, val: "01", rest: "FFFF"},
+		{input: "7FFFFF", kind: Byte, val: "7F", rest: "FFFF"},
 		{input: "80FFFF", kind: String, val: "", rest: "FFFF"},
 		{input: "C3010203", kind: List, val: "010203"},
 
@@ -192,5 +554,347 @@ func TestReadSize(t *testing.T) {
 		if size != test.size {
 			t.Errorf("readSize(%s, %d): size mismatch: got %#x, want %#x", test.input, test.slen, size, test.size)
 		}
+	}
+}
+
+func TestAppendUint64(t *testing.T) {
+	tests := []struct {
+		input  uint64
+		slice  []byte
+		output string
+	}{
+		{0, nil, "80"},
+		{1, nil, "01"},
+		{2, nil, "02"},
+		{127, nil, "7F"},
+		{128, nil, "8180"},
+		{129, nil, "8181"},
+		{0xFFFFFF, nil, "83FFFFFF"},
+		{127, []byte{1, 2, 3}, "0102037F"},
+		{0xFFFFFF, []byte{1, 2, 3}, "01020383FFFFFF"},
+	}
+
+	for _, test := range tests {
+		x := AppendUint64(test.slice, test.input)
+		if !bytes.Equal(x, unhex(test.output)) {
+			t.Errorf("AppendUint64(%v, %d): got %x, want %s", test.slice, test.input, x, test.output)
+		}
+
+		// Check that IntSize returns the appended size.
+		length := len(x) - len(test.slice)
+		if s := IntSize(test.input); s != length {
+			t.Errorf("IntSize(%d): got %d, want %d", test.input, s, length)
+		}
+	}
+}
+
+func TestAppendUint64Random(t *testing.T) {
+	fn := func(i uint64) bool {
+		enc, _ := EncodeToBytes(i)
+		encAppend := AppendUint64(nil, i)
+		return bytes.Equal(enc, encAppend)
+	}
+	config := quick.Config{MaxCountScale: 50}
+	if err := quick.Check(fn, &config); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBytesSize(t *testing.T) {
+	tests := []struct {
+		v    []byte
+		size uint64
+	}{
+		{v: []byte{}, size: 1},
+		{v: []byte{0x1}, size: 1},
+		{v: []byte{0x7E}, size: 1},
+		{v: []byte{0x7F}, size: 1},
+		{v: []byte{0x80}, size: 2},
+		{v: []byte{0xFF}, size: 2},
+		{v: []byte{0xFF, 0xF0}, size: 3},
+		{v: make([]byte, 55), size: 56},
+		{v: make([]byte, 56), size: 58},
+	}
+
+	for _, test := range tests {
+		s := BytesSize(test.v)
+		if s != test.size {
+			t.Errorf("BytesSize(%#x) -> %d, want %d", test.v, s, test.size)
+		}
+		s = StringSize(string(test.v))
+		if s != test.size {
+			t.Errorf("StringSize(%#x) -> %d, want %d", test.v, s, test.size)
+		}
+		// Sanity check:
+		enc, _ := EncodeToBytes(test.v)
+		if uint64(len(enc)) != test.size {
+			t.Errorf("len(EncodeToBytes(%#x)) -> %d, test says %d", test.v, len(enc), test.size)
+		}
+	}
+}
+
+func TestSplitListValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string   // hex-encoded RLP list
+		want    []string // hex-encoded expected elements
+		wantErr error
+	}{
+		{
+			name:  "empty list",
+			input: "C0",
+			want:  []string{},
+		},
+		{
+			name:  "single byte element",
+			input: "C101",
+			want:  []string{"01"},
+		},
+		{
+			name:  "single empty string",
+			input: "C180",
+			want:  []string{"80"},
+		},
+		{
+			name:  "two byte elements",
+			input: "C20102",
+			want:  []string{"01", "02"},
+		},
+		{
+			name:  "three elements",
+			input: "C3010203",
+			want:  []string{"01", "02", "03"},
+		},
+		{
+			name:  "mixed size elements",
+			input: "C80182020283030303",
+			want:  []string{"01", "820202", "83030303"},
+		},
+		{
+			name:  "string elements",
+			input: "C88363617483646F67",
+			want:  []string{"83636174", "83646F67"}, // cat,dog
+		},
+		{
+			name:  "nested list element",
+			input: "C4C3010203",         // [[1,2,3]]
+			want:  []string{"C3010203"}, // [1,2,3]
+		},
+		{
+			name:  "multiple nested lists",
+			input: "C6C20102C20304",             // [[1,2],[3,4]]
+			want:  []string{"C20102", "C20304"}, // [1,2], [3,4]
+		},
+		{
+			name:  "large list",
+			input: "C6010203040506",
+			want:  []string{"01", "02", "03", "04", "05", "06"},
+		},
+		{
+			name:  "list with empty strings",
+			input: "C3808080",
+			want:  []string{"80", "80", "80"},
+		},
+		// Error cases
+		{
+			name:    "single byte",
+			input:   "01",
+			wantErr: ErrExpectedList,
+		},
+		{
+			name:    "string",
+			input:   "83636174",
+			wantErr: ErrExpectedList,
+		},
+		{
+			name:    "empty input",
+			input:   "",
+			wantErr: io.ErrUnexpectedEOF,
+		},
+		{
+			name:    "invalid list - value too large",
+			input:   "C60102030405",
+			wantErr: ErrValueTooLarge,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := SplitListValues(unhex(tt.input))
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("SplitListValues() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("SplitListValues() got %d elements, want %d", len(got), len(tt.want))
+				return
+			}
+			for i, elem := range got {
+				want := unhex(tt.want[i])
+				if !bytes.Equal(elem, want) {
+					t.Errorf("SplitListValues() element[%d] = %x, want %x", i, elem, want)
+				}
+			}
+		})
+	}
+}
+
+func TestMergeListValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		elems   []string // hex-encoded RLP elements
+		want    string   // hex-encoded expected result
+		wantErr error
+	}{
+		{
+			name:  "empty list",
+			elems: []string{},
+			want:  "C0",
+		},
+		{
+			name:  "single byte element",
+			elems: []string{"01"},
+			want:  "C101",
+		},
+		{
+			name:  "single empty string",
+			elems: []string{"80"},
+			want:  "C180",
+		},
+		{
+			name:  "two byte elements",
+			elems: []string{"01", "02"},
+			want:  "C20102",
+		},
+		{
+			name:  "three elements",
+			elems: []string{"01", "02", "03"},
+			want:  "C3010203",
+		},
+		{
+			name:  "mixed size elements",
+			elems: []string{"01", "820202", "83030303"},
+			want:  "C80182020283030303",
+		},
+		{
+			name:  "string elements",
+			elems: []string{"83636174", "83646F67"}, // cat, dog
+			want:  "C88363617483646F67",
+		},
+		{
+			name:  "nested list element",
+			elems: []string{"C20102", "03"}, // [[1, 2], 3]
+			want:  "C4C2010203",
+		},
+		{
+			name:  "multiple nested lists",
+			elems: []string{"C20102", "C3030405"}, // [[1,2],[3,4,5]],
+			want:  "C7C20102C3030405",
+		},
+		{
+			name:  "large list",
+			elems: []string{"01", "02", "03", "04", "05", "06"},
+			want:  "C6010203040506",
+		},
+		{
+			name:  "list with empty strings",
+			elems: []string{"80", "80", "80"},
+			want:  "C3808080",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			elems := make([][]byte, len(tt.elems))
+			for i, s := range tt.elems {
+				elems[i] = unhex(s)
+			}
+			got, err := MergeListValues(elems)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("MergeListValues() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				return
+			}
+			want := unhex(tt.want)
+			if !bytes.Equal(got, want) {
+				t.Errorf("MergeListValues() = %x, want %x", got, want)
+			}
+		})
+	}
+}
+
+func TestSplitMergeList(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string // hex-encoded RLP list
+	}{
+		{
+			name:  "empty list",
+			input: "C0",
+		},
+		{
+			name:  "single byte element",
+			input: "C101",
+		},
+		{
+			name:  "two byte elements",
+			input: "C20102",
+		},
+		{
+			name:  "three elements",
+			input: "C3010203",
+		},
+		{
+			name:  "mixed size elements",
+			input: "C80182020283030303",
+		},
+		{
+			name:  "string elements",
+			input: "C88363617483646F67", // [cat, dog]
+		},
+		{
+			name:  "nested list element",
+			input: "C4C2010203", // [[1,2],3]
+		},
+		{
+			name:  "multiple nested lists",
+			input: "C6C20102C20304", // [[1,2],[3,4]]
+		},
+		{
+			name:  "large list",
+			input: "C6010203040506", // [1,2,3,4,5,6]
+		},
+		{
+			name:  "list with empty strings",
+			input: "C3808080", // ["", "", ""]
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := unhex(tt.input)
+
+			// Split the list
+			elements, err := SplitListValues(original)
+			if err != nil {
+				t.Fatalf("SplitListValues() error = %v", err)
+			}
+
+			// Merge back
+			merged, err := MergeListValues(elements)
+			if err != nil {
+				t.Fatalf("MergeListValues() error = %v", err)
+			}
+
+			// The merged result should match the original
+			if !bytes.Equal(merged, original) {
+				t.Errorf("Round trip failed: original = %x, merged = %x", original, merged)
+			}
+		})
 	}
 }

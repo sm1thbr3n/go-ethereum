@@ -1,0 +1,238 @@
+// Copyright 2022 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package native
+
+import (
+	"encoding/json"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/tracers"
+	"github.com/ethereum/go-ethereum/params"
+)
+
+func init() {
+	tracers.DefaultDirectory.Register("muxTracer", newMuxTracerFromConfig, false)
+}
+
+// muxTracer is a go implementation of the Tracer interface which
+// runs multiple tracers in one go.
+type muxTracer struct {
+	names    []string
+	tracers  []*tracers.Tracer
+	entryGas []tracing.Gas // per-frame entry budget, to derive the V1 gasUsed on exit
+}
+
+// newMuxTracerFromConfig returns a new mux tracer.
+func newMuxTracerFromConfig(ctx *tracers.Context, cfg json.RawMessage, chainConfig *params.ChainConfig) (*tracers.Tracer, error) {
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(cfg, &config); err != nil {
+		return nil, err
+	}
+	objects := make([]*tracers.Tracer, 0, len(config))
+	names := make([]string, 0, len(config))
+	for k, v := range config {
+		t, err := tracers.DefaultDirectory.New(k, ctx, v, chainConfig)
+		if err != nil {
+			return nil, err
+		}
+		objects = append(objects, t)
+		names = append(names, k)
+	}
+	return NewMuxTracer(names, objects)
+}
+
+// NewMuxTracer creates a multiplexing tracer that fans out tracing hooks to
+// multiple child tracers. Each hook invocation is forwarded to all children,
+// in the order they are provided.
+//
+// The names parameter associates a label with each tracer, used as keys in
+// the aggregated JSON result returned by GetResult.
+//
+// For hooks that have both a V1 and V2 form (OnCodeChange / OnCodeChangeV2,
+// OnNonceChange / OnNonceChangeV2, OnGasChange / OnGasChangeV2, OnEnter /
+// OnEnterV2, OnExit / OnExitV2, OnOpcode / OnOpcodeV2, OnFault / OnFaultV2,
+// OnSystemCallStart / OnSystemCallStartV2), the mux exposes only the V2
+// variant upward. The fanout then prefers each child's V2 hook and falls
+// back to V1 if only V1 is set, mirroring the precedence already used in
+// core/state_processor.go.
+func NewMuxTracer(names []string, objects []*tracers.Tracer) (*tracers.Tracer, error) {
+	t := &muxTracer{names: names, tracers: objects}
+	return &tracers.Tracer{
+		Hooks: &tracing.Hooks{
+			OnTxStart:           t.OnTxStart,
+			OnTxEnd:             t.OnTxEnd,
+			OnEnterV2:           t.OnEnterV2,
+			OnExitV2:            t.OnExitV2,
+			OnOpcodeV2:          t.OnOpcodeV2,
+			OnFaultV2:           t.OnFaultV2,
+			OnGasChangeV2:       t.OnGasChangeV2,
+			OnBalanceChange:     t.OnBalanceChange,
+			OnNonceChangeV2:     t.OnNonceChangeV2,
+			OnCodeChangeV2:      t.OnCodeChangeV2,
+			OnStorageChange:     t.OnStorageChange,
+			OnLog:               t.OnLog,
+			OnSystemCallStartV2: t.OnSystemCallStart,
+			OnSystemCallEnd:     t.OnSystemCallEnd,
+		},
+		GetResult: t.GetResult,
+		Stop:      t.Stop,
+	}, nil
+}
+
+func (t *muxTracer) OnOpcodeV2(pc uint64, op byte, gas, cost tracing.Gas, scope tracing.OpContext, rData []byte, depth int, err error) {
+	for _, t := range t.tracers {
+		t.EmitOpcode(pc, op, gas, cost, scope, rData, depth, err)
+	}
+}
+
+func (t *muxTracer) OnFaultV2(pc uint64, op byte, gas, cost tracing.Gas, scope tracing.OpContext, depth int, err error) {
+	for _, t := range t.tracers {
+		t.EmitFault(pc, op, gas, cost, scope, depth, err)
+	}
+}
+
+func (t *muxTracer) OnGasChangeV2(old, new tracing.Gas, reason tracing.GasChangeReason) {
+	for _, t := range t.tracers {
+		if t.OnGasChangeV2 != nil {
+			t.OnGasChangeV2(old, new, reason)
+		} else if t.OnGasChange != nil {
+			t.OnGasChange(old.Execution, new.Execution, reason)
+		}
+	}
+}
+
+func (t *muxTracer) OnEnterV2(depth int, typ byte, from common.Address, to common.Address, input []byte, gas tracing.Gas, value *big.Int) {
+	t.entryGas = append(t.entryGas, gas)
+	for _, t := range t.tracers {
+		t.EmitEnter(depth, typ, from, to, input, gas, value)
+	}
+}
+
+func (t *muxTracer) OnExitV2(depth int, output []byte, gasLeft tracing.Gas, err error, reverted bool) {
+	var entry tracing.Gas
+	if n := len(t.entryGas); n > 0 {
+		entry, t.entryGas = t.entryGas[n-1], t.entryGas[:n-1]
+	}
+	for _, t := range t.tracers {
+		t.EmitExit(depth, output, entry, gasLeft, err, reverted)
+	}
+}
+
+func (t *muxTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
+	for _, t := range t.tracers {
+		if t.OnTxStart != nil {
+			t.OnTxStart(env, tx, from)
+		}
+	}
+}
+
+func (t *muxTracer) OnTxEnd(receipt *types.Receipt, err error) {
+	for _, t := range t.tracers {
+		if t.OnTxEnd != nil {
+			t.OnTxEnd(receipt, err)
+		}
+	}
+}
+
+func (t *muxTracer) OnBalanceChange(a common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+	for _, t := range t.tracers {
+		if t.OnBalanceChange != nil {
+			t.OnBalanceChange(a, prev, new, reason)
+		}
+	}
+}
+
+func (t *muxTracer) OnNonceChangeV2(a common.Address, prev, new uint64, reason tracing.NonceChangeReason) {
+	for _, t := range t.tracers {
+		if t.OnNonceChangeV2 != nil {
+			t.OnNonceChangeV2(a, prev, new, reason)
+		} else if t.OnNonceChange != nil {
+			t.OnNonceChange(a, prev, new)
+		}
+	}
+}
+
+func (t *muxTracer) OnCodeChangeV2(a common.Address, prevCodeHash common.Hash, prev []byte, codeHash common.Hash, code []byte, reason tracing.CodeChangeReason) {
+	for _, t := range t.tracers {
+		if t.OnCodeChangeV2 != nil {
+			t.OnCodeChangeV2(a, prevCodeHash, prev, codeHash, code, reason)
+		} else if t.OnCodeChange != nil {
+			t.OnCodeChange(a, prevCodeHash, prev, codeHash, code)
+		}
+	}
+}
+
+func (t *muxTracer) OnStorageChange(a common.Address, k, prev, new common.Hash) {
+	for _, t := range t.tracers {
+		if t.OnStorageChange != nil {
+			t.OnStorageChange(a, k, prev, new)
+		}
+	}
+}
+
+func (t *muxTracer) OnLog(log *types.Log) {
+	for _, t := range t.tracers {
+		if t.OnLog != nil {
+			t.OnLog(log)
+		}
+	}
+}
+
+func (t *muxTracer) OnSystemCallStart(vm *tracing.VMContext) {
+	for _, t := range t.tracers {
+		if t.OnSystemCallStartV2 != nil {
+			t.OnSystemCallStartV2(vm)
+		} else if t.OnSystemCallStart != nil {
+			t.OnSystemCallStart()
+		}
+	}
+}
+
+func (t *muxTracer) OnSystemCallEnd() {
+	for _, t := range t.tracers {
+		if t.OnSystemCallEnd != nil {
+			t.OnSystemCallEnd()
+		}
+	}
+}
+
+// GetResult returns an empty json object.
+func (t *muxTracer) GetResult() (json.RawMessage, error) {
+	resObject := make(map[string]json.RawMessage)
+	for i, tt := range t.tracers {
+		r, err := tt.GetResult()
+		if err != nil {
+			return nil, err
+		}
+		resObject[t.names[i]] = r
+	}
+	res, err := json.Marshal(resObject)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// Stop terminates execution of the tracer at the first opportune moment.
+func (t *muxTracer) Stop(err error) {
+	for _, t := range t.tracers {
+		t.Stop(err)
+	}
+}

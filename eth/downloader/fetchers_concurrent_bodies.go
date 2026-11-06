@@ -1,0 +1,113 @@
+// Copyright 2021 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package downloader
+
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+)
+
+// bodyQueue implements typedQueue and is a type adapter between the generic
+// concurrent fetcher and the downloader.
+type bodyQueue Downloader
+
+// waker returns a notification channel that gets pinged in case more body
+// fetches have been queued up, so the fetcher might assign it to idle peers.
+func (q *bodyQueue) waker() chan bool {
+	return q.queue.blockWakeCh
+}
+
+// pending returns the number of bodies that are currently queued for fetching
+// by the concurrent downloader.
+func (q *bodyQueue) pending() int {
+	return q.queue.PendingBodies()
+}
+
+// next returns the number of the block at the head of the body retrieval
+// queue, false if none is pending.
+func (q *bodyQueue) next() (uint64, bool) {
+	return q.queue.NextBody()
+}
+
+// capacity is responsible for calculating how many bodies a particular peer is
+// estimated to be able to retrieve within the allotted round trip time.
+func (q *bodyQueue) capacity(peer *peerConnection, rtt time.Duration) int {
+	return peer.BodyCapacity(rtt)
+}
+
+// updateCapacity is responsible for updating how many bodies a particular peer
+// is estimated to be able to retrieve in a unit time.
+func (q *bodyQueue) updateCapacity(peer *peerConnection, items int, span time.Duration) {
+	peer.UpdateBodyRate(items, span)
+}
+
+// reserve is responsible for allocating a requested number of pending bodies
+// from the download queue to the specified peer.
+func (q *bodyQueue) reserve(peer *peerConnection, items int) (*fetchRequest, bool, bool) {
+	return q.queue.ReserveBodies(peer, items)
+}
+
+// requeue is responsible for placing the current body retrieval allocation of a
+// specific peer back into the pool for some other peer to retrieve as well.
+func (q *bodyQueue) requeue(peer string) {
+	q.queue.RequeueBodies(peer)
+}
+
+// request is responsible for converting a generic fetch request into a body
+// one and sending it to the remote peer for fulfillment.
+func (q *bodyQueue) request(peer *peerConnection, req *fetchRequest, resCh chan *eth.Response) (*eth.Request, error) {
+	peer.log.Trace("Requesting new batch of bodies", "count", len(req.Headers), "from", req.Headers[0].Number)
+	if q.bodyFetchHook != nil {
+		q.bodyFetchHook(req.Headers)
+	}
+	hashes := make([]common.Hash, 0, len(req.Headers))
+	for _, header := range req.Headers {
+		hashes = append(hashes, header.Hash())
+	}
+	return peer.peer.RequestBodies(hashes, resCh)
+}
+
+// deliver is responsible for taking a generic response packet from the concurrent
+// fetcher, unpacking the body data and delivering it to the downloader's queue.
+func (q *bodyQueue) deliver(peer *peerConnection, packet *eth.Response) (int, error) {
+	resp := packet.Res.(*eth.BlockBodiesResponse)
+	meta := packet.Meta.(eth.BlockBodyHashes)
+	accepted, err := q.queue.DeliverBodies(peer.id, meta, *resp)
+	switch {
+	case err == nil && len(*resp) == 0:
+		peer.log.Trace("Requested bodies delivered")
+	case err == nil:
+		peer.log.Trace("Delivered new batch of bodies", "count", len(*resp), "accepted", accepted)
+	default:
+		peer.log.Debug("Failed to deliver retrieved bodies", "err", err)
+	}
+	return accepted, err
+}
+
+// stalled returns the peer whose body request holds the head of the result
+// cache for longer than the given threshold, blocking the consumer.
+func (q *bodyQueue) stalled(threshold time.Duration) string {
+	return q.queue.StalledBodies(threshold)
+}
+
+// metrics returns the collectors the concurrent fetcher reports the scheduling
+// state of body retrievals into.
+func (q *bodyQueue) metrics() *fetchMetrics {
+	return bodyFetchMetrics
+}

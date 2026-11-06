@@ -21,13 +21,14 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -55,18 +56,6 @@ const (
 	pongMsg      = 0x03
 )
 
-// protoHandshake is the RLP structure of the protocol handshake.
-type protoHandshake struct {
-	Version    uint64
-	Name       string
-	Caps       []Cap
-	ListenPort uint64
-	ID         []byte // secp256k1 public key
-
-	// Ignore additional fields (for forward compatibility).
-	Rest []rlp.RawValue `rlp:"tail"`
-}
-
 // PeerEventType is the type of peer events emitted by a p2p.Server
 type PeerEventType string
 
@@ -91,12 +80,14 @@ const (
 // PeerEvent is an event emitted when peers are either added or dropped from
 // a p2p.Server or when a message is sent or received on a peer connection
 type PeerEvent struct {
-	Type     PeerEventType `json:"type"`
-	Peer     enode.ID      `json:"peer"`
-	Error    string        `json:"error,omitempty"`
-	Protocol string        `json:"protocol,omitempty"`
-	MsgCode  *uint64       `json:"msg_code,omitempty"`
-	MsgSize  *uint32       `json:"msg_size,omitempty"`
+	Type          PeerEventType `json:"type"`
+	Peer          enode.ID      `json:"peer"`
+	Error         string        `json:"error,omitempty"`
+	Protocol      string        `json:"protocol,omitempty"`
+	MsgCode       *uint64       `json:"msg_code,omitempty"`
+	MsgSize       *uint32       `json:"msg_size,omitempty"`
+	LocalAddress  string        `json:"local,omitempty"`
+	RemoteAddress string        `json:"remote,omitempty"`
 }
 
 // Peer represents a connected remote node.
@@ -109,20 +100,39 @@ type Peer struct {
 	wg       sync.WaitGroup
 	protoErr chan error
 	closed   chan struct{}
+	pingRecv chan struct{}
 	disc     chan DiscReason
 
 	// events receives message send / receive events if set
-	events *event.Feed
+	events   *event.Feed
+	testPipe *MsgPipeRW // for testing
 }
 
 // NewPeer returns a peer for testing purposes.
 func NewPeer(id enode.ID, name string, caps []Cap) *Peer {
+	// Generate a fake set of local protocols to match as running caps. Almost
+	// no fields needs to be meaningful here as we're only using it to cross-
+	// check with the "remote" caps array.
+	protos := make([]Protocol, len(caps))
+	for i, cap := range caps {
+		protos[i].Name = cap.Name
+		protos[i].Version = cap.Version
+	}
 	pipe, _ := net.Pipe()
 	node := enode.SignNull(new(enr.Record), id)
 	conn := &conn{fd: pipe, transport: nil, node: node, caps: caps, name: name}
-	peer := newPeer(conn, nil)
+	peer := newPeer(log.Root(), conn, protos)
 	close(peer.closed) // ensures Disconnect doesn't block
 	return peer
+}
+
+// NewPeerPipe creates a peer for testing purposes.
+// The message pipe given as the last parameter is closed when
+// Disconnect is called on the peer.
+func NewPeerPipe(id enode.ID, name string, caps []Cap, pipe *MsgPipeRW) *Peer {
+	p := NewPeer(id, name, caps)
+	p.testPipe = pipe
+	return p
 }
 
 // ID returns the node's public key.
@@ -135,15 +145,37 @@ func (p *Peer) Node() *enode.Node {
 	return p.rw.node
 }
 
-// Name returns the node name that the remote node advertised.
+// Name returns an abbreviated form of the name
 func (p *Peer) Name() string {
+	s := p.rw.name
+	if len(s) > 20 {
+		return s[:20] + "..."
+	}
+	return s
+}
+
+// Fullname returns the node name that the remote node advertised.
+func (p *Peer) Fullname() string {
 	return p.rw.name
 }
 
 // Caps returns the capabilities (supported subprotocols) of the remote peer.
 func (p *Peer) Caps() []Cap {
-	// TODO: maybe return copy
 	return p.rw.caps
+}
+
+// RunningCap returns true if the peer is actively connected using any of the
+// enumerated versions of a specific protocol, meaning that at least one of the
+// versions is supported by both this node and the peer p.
+func (p *Peer) RunningCap(protocol string, versions []uint) bool {
+	if proto, ok := p.running[protocol]; ok {
+		for _, ver := range versions {
+			if proto.Version == ver {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RemoteAddr returns the remote address of the network connection.
@@ -159,6 +191,10 @@ func (p *Peer) LocalAddr() net.Addr {
 // Disconnect terminates the peer connection with the given reason.
 // It returns immediately and does not wait until the connection is closed.
 func (p *Peer) Disconnect(reason DiscReason) {
+	if p.testPipe != nil {
+		p.testPipe.Close()
+	}
+
 	select {
 	case p.disc <- reason:
 	case <-p.closed:
@@ -171,12 +207,42 @@ func (p *Peer) String() string {
 	return fmt.Sprintf("Peer %x %v", id[:8], p.RemoteAddr())
 }
 
-// Inbound returns true if the peer is an inbound connection
+// Inbound returns true if the peer is an inbound (not dialed) connection.
 func (p *Peer) Inbound() bool {
 	return p.rw.is(inboundConn)
 }
 
-func newPeer(conn *conn, protocols []Protocol) *Peer {
+// IsBrowser returns true if the peer is an unverified inbound peer connected
+// over QUIC, budgeted separately from other peers.
+func (p *Peer) IsBrowser() bool {
+	return p.rw.isBrowser()
+}
+
+// Trusted returns true if the peer is configured as trusted.
+// Trusted peers are accepted in above the MaxInboundConns limit.
+// The peer can be either inbound or dialed.
+func (p *Peer) Trusted() bool {
+	return p.rw.is(trustedConn)
+}
+
+// DynDialed returns true if the peer was dialed successfully (passed handshake) and
+// it is not configured as static.
+func (p *Peer) DynDialed() bool {
+	return p.rw.is(dynDialedConn)
+}
+
+// StaticDialed returns true if the peer was dialed successfully (passed handshake) and
+// it is configured as static.
+func (p *Peer) StaticDialed() bool {
+	return p.rw.is(staticDialedConn)
+}
+
+// Lifetime returns the time since peer creation.
+func (p *Peer) Lifetime() mclock.AbsTime {
+	return mclock.Now() - p.created
+}
+
+func newPeer(log log.Logger, conn *conn, protocols []Protocol) *Peer {
 	protomap := matchProtocols(protocols, conn.caps, conn)
 	p := &Peer{
 		rw:       conn,
@@ -185,6 +251,7 @@ func newPeer(conn *conn, protocols []Protocol) *Peer {
 		disc:     make(chan DiscReason),
 		protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop
 		closed:   make(chan struct{}),
+		pingRecv: make(chan struct{}, 16),
 		log:      log.New("id", conn.node.ID(), "conn", conn.flags),
 	}
 	return p
@@ -201,9 +268,15 @@ func (p *Peer) run() (remoteRequested bool, err error) {
 		readErr    = make(chan error, 1)
 		reason     DiscReason // sent to the peer
 	)
-	p.wg.Add(2)
+	p.wg.Add(1)
 	go p.readLoop(readErr)
-	go p.pingLoop()
+	// Browser peers do not support ping/pong.
+	if !p.rw.isBrowser() {
+		p.wg.Add(1)
+		go p.pingLoop()
+	}
+	live1min := time.NewTimer(1 * time.Minute)
+	defer live1min.Stop()
 
 	// Start all protocol handlers.
 	writeStart <- struct{}{}
@@ -235,6 +308,12 @@ loop:
 		case err = <-p.disc:
 			reason = discReasonForError(err)
 			break loop
+		case <-live1min.C:
+			if p.Inbound() {
+				serve1MinSuccessMeter.Mark(1)
+			} else {
+				dial1MinSuccessMeter.Mark(1)
+			}
 		}
 	}
 
@@ -245,9 +324,11 @@ loop:
 }
 
 func (p *Peer) pingLoop() {
-	ping := time.NewTimer(pingInterval)
 	defer p.wg.Done()
+
+	ping := time.NewTimer(pingInterval)
 	defer ping.Stop()
+
 	for {
 		select {
 		case <-ping.C:
@@ -256,6 +337,10 @@ func (p *Peer) pingLoop() {
 				return
 			}
 			ping.Reset(pingInterval)
+
+		case <-p.pingRecv:
+			SendItems(p.rw, pongMsg)
+
 		case <-p.closed:
 			return
 		}
@@ -281,14 +366,20 @@ func (p *Peer) readLoop(errc chan<- error) {
 func (p *Peer) handle(msg Msg) error {
 	switch {
 	case msg.Code == pingMsg:
+		if p.rw.isBrowser() {
+			// browser connections ignore base protocol messages,
+			// including pingMsg.
+			return msg.Discard()
+		}
 		msg.Discard()
-		go SendItems(p.rw, pongMsg)
+		select {
+		case p.pingRecv <- struct{}{}:
+		case <-p.closed:
+		}
 	case msg.Code == discMsg:
-		var reason [1]DiscReason
 		// This is the last message. We don't need to discard or
 		// check errors because, the connection will be closed after it.
-		rlp.Decode(msg.Payload, &reason)
-		return reason[0]
+		return decodeDisconnectMessage(msg.Payload)
 	case msg.Code < baseProtocolLength:
 		// ignore other base protocol messages
 		return msg.Discard()
@@ -298,6 +389,11 @@ func (p *Peer) handle(msg Msg) error {
 		if err != nil {
 			return fmt.Errorf("msg code out of range: %v", msg.Code)
 		}
+		if metrics.Enabled() {
+			m := fmt.Sprintf("%s/%s/%d/%#02x", ingressMeterName, proto.Name, proto.Version, msg.Code-proto.offset)
+			metrics.GetOrRegisterMeter(m, nil).Mark(int64(msg.meterSize))
+			metrics.GetOrRegisterMeter(m+"/packets", nil).Mark(1)
+		}
 		select {
 		case proto.in <- msg:
 			return nil
@@ -306,6 +402,27 @@ func (p *Peer) handle(msg Msg) error {
 		}
 	}
 	return nil
+}
+
+// decodeDisconnectMessage decodes the payload of discMsg.
+func decodeDisconnectMessage(r io.Reader) (reason DiscReason) {
+	s := rlp.NewStream(r, 100)
+	k, _, err := s.Kind()
+	if err != nil {
+		return DiscInvalid
+	}
+	if k == rlp.List {
+		s.List()
+		err = s.Decode(&reason)
+	} else {
+		// Legacy path: some implementations, including geth, used to send the disconnect
+		// reason as a byte array by accident.
+		err = s.Decode(&reason)
+	}
+	if err != nil {
+		reason = DiscInvalid
+	}
+	return reason
 }
 
 func countMatchingProtocols(protocols []Protocol, caps []Cap) int {
@@ -322,7 +439,7 @@ func countMatchingProtocols(protocols []Protocol, caps []Cap) int {
 
 // matchProtocols creates structures for matching named subprotocols.
 func matchProtocols(protocols []Protocol, caps []Cap, rw MsgReadWriter) map[string]*protoRW {
-	sort.Sort(capsByNameAndVersion(caps))
+	slices.SortFunc(caps, Cap.Cmp)
 	offset := baseProtocolLength
 	result := make(map[string]*protoRW)
 
@@ -348,25 +465,24 @@ outer:
 func (p *Peer) startProtocols(writeStart <-chan struct{}, writeErr chan<- error) {
 	p.wg.Add(len(p.running))
 	for _, proto := range p.running {
-		proto := proto
 		proto.closed = p.closed
 		proto.wstart = writeStart
 		proto.werr = writeErr
 		var rw MsgReadWriter = proto
 		if p.events != nil {
-			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name)
+			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name, p.Info().Network.RemoteAddress, p.Info().Network.LocalAddress)
 		}
 		p.log.Trace(fmt.Sprintf("Starting protocol %s/%d", proto.Name, proto.Version))
 		go func() {
+			defer p.wg.Done()
 			err := proto.Run(p, rw)
 			if err == nil {
 				p.log.Trace(fmt.Sprintf("Protocol %s/%d returned", proto.Name, proto.Version))
 				err = errProtocolReturned
-			} else if err != io.EOF {
+			} else if !errors.Is(err, io.EOF) {
 				p.log.Trace(fmt.Sprintf("Protocol %s/%d failed", proto.Name, proto.Version), "err", err)
 			}
 			p.protoErr <- err
-			p.wg.Done()
 		}()
 	}
 }
@@ -396,7 +512,11 @@ func (rw *protoRW) WriteMsg(msg Msg) (err error) {
 	if msg.Code >= rw.Length {
 		return newPeerError(errInvalidMsgCode, "not handled")
 	}
+	msg.meterCap = rw.cap()
+	msg.meterCode = msg.Code
+
 	msg.Code += rw.offset
+
 	select {
 	case <-rw.wstart:
 		err = rw.w.WriteMsg(msg)
@@ -425,10 +545,11 @@ func (rw *protoRW) ReadMsg() (Msg, error) {
 // peer. Sub-protocol independent fields are contained and initialized here, with
 // protocol specifics delegated to all connected sub-protocols.
 type PeerInfo struct {
-	Enode   string   `json:"enode"` // Node URL
-	ID      string   `json:"id"`    // Unique node identifier
-	Name    string   `json:"name"`  // Name of the node, including client type, version, OS, custom data
-	Caps    []string `json:"caps"`  // Protocols advertised by this peer
+	ENR     string   `json:"enr,omitempty"` // Ethereum Node Record
+	Enode   string   `json:"enode"`         // Node URL
+	ID      string   `json:"id"`            // Unique node identifier
+	Name    string   `json:"name"`          // Name of the node, including client type, version, OS, custom data
+	Caps    []string `json:"caps"`          // Protocols advertised by this peer
 	Network struct {
 		LocalAddress  string `json:"localAddress"`  // Local endpoint of the TCP data connection
 		RemoteAddress string `json:"remoteAddress"` // Remote endpoint of the TCP data connection
@@ -448,11 +569,14 @@ func (p *Peer) Info() *PeerInfo {
 	}
 	// Assemble the generic peer metadata
 	info := &PeerInfo{
-		Enode:     p.Node().String(),
+		Enode:     p.Node().URLv4(),
 		ID:        p.ID().String(),
-		Name:      p.Name(),
+		Name:      p.Fullname(),
 		Caps:      caps,
-		Protocols: make(map[string]interface{}),
+		Protocols: make(map[string]interface{}, len(p.running)),
+	}
+	if p.Node().Seq() > 0 {
+		info.ENR = p.Node().String()
 	}
 	info.Network.LocalAddress = p.LocalAddr().String()
 	info.Network.RemoteAddress = p.RemoteAddr().String()

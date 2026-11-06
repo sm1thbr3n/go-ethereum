@@ -17,39 +17,85 @@
 package eth
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-// Tests that fast sync gets disabled as soon as a real block is successfully
+// Tests that snap sync is disabled after a successful sync cycle.
+func TestSnapSyncDisabling69(t *testing.T) { testSnapSyncDisabling(t, eth.ETH69, snap.SNAP1) }
+
+// Tests that snap sync gets disabled as soon as a real block is successfully
 // imported into the blockchain.
-func TestFastSyncDisabling(t *testing.T) {
-	// Create a pristine protocol manager, check that fast sync is left enabled
-	pmEmpty, _ := newTestProtocolManagerMust(t, downloader.FastSync, 0, nil, nil)
-	if atomic.LoadUint32(&pmEmpty.fastSync) == 0 {
-		t.Fatalf("fast sync disabled on pristine blockchain")
-	}
-	// Create a full protocol manager, check that fast sync gets disabled
-	pmFull, _ := newTestProtocolManagerMust(t, downloader.FastSync, 1024, nil, nil)
-	if atomic.LoadUint32(&pmFull.fastSync) == 1 {
-		t.Fatalf("fast sync not disabled on non-empty blockchain")
-	}
-	// Sync up the two peers
-	io1, io2 := p2p.MsgPipe()
+func testSnapSyncDisabling(t *testing.T, ethVer uint, snapVer uint) {
+	t.Parallel()
 
-	go pmFull.handle(pmFull.newPeer(63, p2p.NewPeer(enode.ID{}, "empty", nil), io2))
-	go pmEmpty.handle(pmEmpty.newPeer(63, p2p.NewPeer(enode.ID{}, "full", nil), io1))
+	// Create an empty handler and ensure it's in snap sync mode
+	empty := newTestHandler(ethconfig.SnapSync)
+	defer empty.close()
 
+	// Create a full handler and ensure snap sync ends up disabled
+	full := newTestHandlerWithBlocks(1024, ethconfig.SnapSync)
+	defer full.close()
+
+	// Sync up the two handlers via both `eth` and `snap`
+	caps := []p2p.Cap{{Name: "eth", Version: ethVer}, {Name: "snap", Version: snapVer}}
+
+	emptyPipeEth, fullPipeEth := p2p.MsgPipe()
+	defer emptyPipeEth.Close()
+	defer fullPipeEth.Close()
+
+	emptyPeerEth := eth.NewPeer(ethVer, p2p.NewPeer(enode.ID{1}, "", caps), emptyPipeEth, empty.txpool, empty.blobpool, nil)
+	fullPeerEth := eth.NewPeer(ethVer, p2p.NewPeer(enode.ID{2}, "", caps), fullPipeEth, full.txpool, full.blobpool, nil)
+	defer emptyPeerEth.Close()
+	defer fullPeerEth.Close()
+
+	go empty.handler.runEthPeer(emptyPeerEth, func(peer *eth.Peer) error {
+		return eth.Handle((*ethHandler)(empty.handler), peer)
+	})
+	go full.handler.runEthPeer(fullPeerEth, func(peer *eth.Peer) error {
+		return eth.Handle((*ethHandler)(full.handler), peer)
+	})
+
+	emptyPipeSnap, fullPipeSnap := p2p.MsgPipe()
+	defer emptyPipeSnap.Close()
+	defer fullPipeSnap.Close()
+
+	emptyPeerSnap := snap.NewPeer(snapVer, p2p.NewPeer(enode.ID{1}, "", caps), emptyPipeSnap)
+	fullPeerSnap := snap.NewPeer(snapVer, p2p.NewPeer(enode.ID{2}, "", caps), fullPipeSnap)
+
+	go empty.handler.runSnapExtension(emptyPeerSnap, func(peer *snap.Peer) error {
+		return snap.Handle((*snapHandler)(empty.handler), peer)
+	})
+	go full.handler.runSnapExtension(fullPeerSnap, func(peer *snap.Peer) error {
+		return snap.Handle((*snapHandler)(full.handler), peer)
+	})
+	// Wait a bit for the above handlers to start
 	time.Sleep(250 * time.Millisecond)
-	pmEmpty.synchronise(pmEmpty.peers.BestPeer())
 
-	// Check that fast sync was disabled
-	if atomic.LoadUint32(&pmEmpty.fastSync) == 1 {
-		t.Fatalf("fast sync not disabled after successful synchronisation")
+	// Check that snap sync was disabled
+	if err := empty.handler.downloader.BeaconSync(full.chain.CurrentBlock(), nil); err != nil {
+		t.Fatal("sync failed:", err)
+	}
+	// Snap sync and mode switching happen asynchronously, poll for completion.
+	timeout := time.NewTimer(15 * time.Second)
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer timeout.Stop()
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-timeout.C:
+			t.Fatalf("snap sync not disabled after successful synchronisation")
+		case <-tick.C:
+			if empty.handler.synced.Load() && empty.handler.downloader.ConfigSyncMode() == ethconfig.FullSync {
+				return
+			}
+		}
 	}
 }

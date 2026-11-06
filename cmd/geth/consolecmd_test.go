@@ -19,7 +19,6 @@ package main
 import (
 	"crypto/rand"
 	"math/big"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -27,31 +26,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/internal/version"
 )
 
 const (
-	ipcAPIs  = "admin:1.0 debug:1.0 eth:1.0 ethash:1.0 miner:1.0 net:1.0 personal:1.0 rpc:1.0 shh:1.0 txpool:1.0 web3:1.0"
+	ipcAPIs  = "admin:1.0 debug:1.0 engine:1.0 eth:1.0 miner:1.0 net:1.0 rpc:1.0 testing:1.0 txpool:1.0 web3:1.0"
 	httpAPIs = "eth:1.0 net:1.0 rpc:1.0 web3:1.0"
 )
+
+// spawns geth with the given command line args, using a set of flags to minimise
+// memory and disk IO. If the args don't set --datadir, the
+// child g gets a temporary data directory.
+func runMinimalGeth(t *testing.T, args ...string) *testgeth {
+	// --hoodi to make the 'writing genesis to disk' faster (no accounts)
+	// --networkid=1337 to avoid cache bump
+	// --syncmode=full to avoid allocating fast sync bloom
+	allArgs := []string{"--hoodi", "--networkid", "1337", "--authrpc.port", "0", "--syncmode=full", "--port", "0",
+		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--cache", "64",
+		"--datadir.minfreedisk", "0"}
+	return runGeth(t, append(allArgs, args...)...)
+}
 
 // Tests that a node embedded within a console can be started up properly and
 // then terminated by closing the input stream.
 func TestConsoleWelcome(t *testing.T) {
-	coinbase := "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
+	t.Parallel()
 
 	// Start a geth console, make sure it's cleaned up and terminate the console
-	geth := runGeth(t,
-		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--shh",
-		"console")
+	geth := runMinimalGeth(t, "console")
 
 	// Gather all the infos the welcome message needs to contain
 	geth.SetTemplateFunc("goos", func() string { return runtime.GOOS })
 	geth.SetTemplateFunc("goarch", func() string { return runtime.GOARCH })
 	geth.SetTemplateFunc("gover", runtime.Version)
-	geth.SetTemplateFunc("gethver", func() string { return params.VersionWithMeta })
-	geth.SetTemplateFunc("niltime", func() string { return time.Unix(0, 0).Format(time.RFC1123) })
+	geth.SetTemplateFunc("gethver", func() string { return version.WithCommit("", "") })
+	geth.SetTemplateFunc("niltime", func() string {
+		return time.Unix(1742212800, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+	})
 	geth.SetTemplateFunc("apis", func() string { return ipcAPIs })
 
 	// Verify the actual welcome message to the required template
@@ -59,72 +70,56 @@ func TestConsoleWelcome(t *testing.T) {
 Welcome to the Geth JavaScript console!
 
 instance: Geth/v{{gethver}}/{{goos}}-{{goarch}}/{{gover}}
-coinbase: {{.Etherbase}}
 at block: 0 ({{niltime}})
  datadir: {{.Datadir}}
  modules: {{apis}}
 
+To exit, press ctrl-d or type exit
 > {{.InputLine "exit"}}
 `)
 	geth.ExpectExit()
 }
 
 // Tests that a console can be attached to a running node via various means.
-func TestIPCAttachWelcome(t *testing.T) {
-	// Configure the instance for IPC attachement
-	coinbase := "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
-	var ipc string
+func TestAttachWelcome(t *testing.T) {
+	var (
+		ipc      string
+		httpPort string
+		wsPort   string
+	)
+	// Configure the instance for IPC attachment
 	if runtime.GOOS == "windows" {
 		ipc = `\\.\pipe\geth` + strconv.Itoa(trulyRandInt(100000, 999999))
 	} else {
-		ws := tmpdir(t)
-		defer os.RemoveAll(ws)
-		ipc = filepath.Join(ws, "geth.ipc")
+		ipc = filepath.Join(t.TempDir(), "geth.ipc")
 	}
-	// Note: we need --shh because testAttachWelcome checks for default
-	// list of ipc modules and shh is included there.
-	geth := runGeth(t,
-		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--shh", "--ipcpath", ipc)
-
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
-	testAttachWelcome(t, geth, "ipc:"+ipc, ipcAPIs)
-
-	geth.Interrupt()
-	geth.ExpectExit()
-}
-
-func TestHTTPAttachWelcome(t *testing.T) {
-	coinbase := "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
-	port := strconv.Itoa(trulyRandInt(1024, 65536)) // Yeah, sometimes this will fail, sorry :P
-	geth := runGeth(t,
-		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--rpc", "--rpcport", port)
-
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
-	testAttachWelcome(t, geth, "http://localhost:"+port, httpAPIs)
-
-	geth.Interrupt()
-	geth.ExpectExit()
-}
-
-func TestWSAttachWelcome(t *testing.T) {
-	coinbase := "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
-	port := strconv.Itoa(trulyRandInt(1024, 65536)) // Yeah, sometimes this will fail, sorry :P
-
-	geth := runGeth(t,
-		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--ws", "--wsport", port)
-
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
-	testAttachWelcome(t, geth, "ws://localhost:"+port, httpAPIs)
-
-	geth.Interrupt()
-	geth.ExpectExit()
+	// And HTTP + WS attachment
+	p := trulyRandInt(1024, 65533) // Yeah, sometimes this will fail, sorry :P
+	httpPort = strconv.Itoa(p)
+	wsPort = strconv.Itoa(p + 1)
+	geth := runMinimalGeth(t,
+		"--ipcpath", ipc,
+		"--http", "--http.port", httpPort,
+		"--ws", "--ws.port", wsPort)
+	t.Run("ipc", func(t *testing.T) {
+		waitForEndpoint(t, ipc, 2*time.Minute)
+		testAttachWelcome(t, geth, "ipc:"+ipc, ipcAPIs)
+	})
+	t.Run("http", func(t *testing.T) {
+		endpoint := "http://127.0.0.1:" + httpPort
+		waitForEndpoint(t, endpoint, 2*time.Minute)
+		testAttachWelcome(t, geth, endpoint, httpAPIs)
+	})
+	t.Run("ws", func(t *testing.T) {
+		endpoint := "ws://127.0.0.1:" + wsPort
+		waitForEndpoint(t, endpoint, 2*time.Minute)
+		testAttachWelcome(t, geth, endpoint, httpAPIs)
+	})
+	geth.Kill()
 }
 
 func testAttachWelcome(t *testing.T, geth *testgeth, endpoint, apis string) {
-	// Attach to a running geth note and terminate immediately
+	// Attach to a running geth node and terminate immediately
 	attach := runGeth(t, "attach", endpoint)
 	defer attach.ExpectExit()
 	attach.CloseStdin()
@@ -133,9 +128,10 @@ func testAttachWelcome(t *testing.T, geth *testgeth, endpoint, apis string) {
 	attach.SetTemplateFunc("goos", func() string { return runtime.GOOS })
 	attach.SetTemplateFunc("goarch", func() string { return runtime.GOARCH })
 	attach.SetTemplateFunc("gover", runtime.Version)
-	attach.SetTemplateFunc("gethver", func() string { return params.VersionWithMeta })
-	attach.SetTemplateFunc("etherbase", func() string { return geth.Etherbase })
-	attach.SetTemplateFunc("niltime", func() string { return time.Unix(0, 0).Format(time.RFC1123) })
+	attach.SetTemplateFunc("gethver", func() string { return version.WithCommit("", "") })
+	attach.SetTemplateFunc("niltime", func() string {
+		return time.Unix(1742212800, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+	})
 	attach.SetTemplateFunc("ipc", func() bool { return strings.HasPrefix(endpoint, "ipc") })
 	attach.SetTemplateFunc("datadir", func() string { return geth.Datadir })
 	attach.SetTemplateFunc("apis", func() string { return apis })
@@ -145,18 +141,18 @@ func testAttachWelcome(t *testing.T, geth *testgeth, endpoint, apis string) {
 Welcome to the Geth JavaScript console!
 
 instance: Geth/v{{gethver}}/{{goos}}-{{goarch}}/{{gover}}
-coinbase: {{etherbase}}
 at block: 0 ({{niltime}}){{if ipc}}
  datadir: {{datadir}}{{end}}
  modules: {{apis}}
 
+To exit, press ctrl-d or type exit
 > {{.InputLine "exit" }}
 `)
 	attach.ExpectExit()
 }
 
 // trulyRandInt generates a crypto random integer used by the console tests to
-// not clash network ports with other tests running cocurrently.
+// not clash network ports with other tests running concurrently.
 func trulyRandInt(lo, hi int) int {
 	num, _ := rand.Int(rand.Reader, big.NewInt(int64(hi-lo)))
 	return int(num.Int64()) + lo

@@ -20,37 +20,51 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"math/big"
 	"os"
 	"reflect"
+	"runtime"
+	"slices"
+	"strings"
 	"unicode"
 
-	cli "gopkg.in/urfave/cli.v1"
-
+	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/external"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/ethereum/go-ethereum/accounts/scwallet"
+	"github.com/ethereum/go-ethereum/accounts/usbwallet"
+	"github.com/ethereum/go-ethereum/beacon/blsync"
 	"github.com/ethereum/go-ethereum/cmd/utils"
-	"github.com/ethereum/go-ethereum/dashboard"
-	"github.com/ethereum/go-ethereum/eth"
-	"github.com/ethereum/go-ethereum/graphql"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/eth/catalyst"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/eth/syncer"
+	"github.com/ethereum/go-ethereum/internal/flags"
+	"github.com/ethereum/go-ethereum/internal/telemetry/tracesetup"
+	"github.com/ethereum/go-ethereum/internal/version"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
-	"github.com/ethereum/go-ethereum/params"
-	whisper "github.com/ethereum/go-ethereum/whisper/whisperv6"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/naoina/toml"
+	"github.com/urfave/cli/v2"
 )
 
 var (
-	dumpConfigCommand = cli.Command{
-		Action:      utils.MigrateFlags(dumpConfig),
+	dumpConfigCommand = &cli.Command{
+		Action:      dumpConfig,
 		Name:        "dumpconfig",
-		Usage:       "Show configuration values",
-		ArgsUsage:   "",
-		Flags:       append(append(nodeFlags, rpcFlags...), whisperFlags...),
-		Category:    "MISCELLANEOUS COMMANDS",
-		Description: `The dumpconfig command shows configuration values.`,
+		Usage:       "Export configuration values in a TOML format",
+		ArgsUsage:   "<dumpfile (optional)>",
+		Flags:       slices.Concat(nodeFlags, rpcFlags),
+		Description: `Export configuration values in TOML format (to stdout by default).`,
 	}
 
-	configFileFlag = cli.StringFlag{
-		Name:  "config",
-		Usage: "TOML configuration file",
+	configFileFlag = &cli.StringFlag{
+		Name:     "config",
+		Usage:    "TOML configuration file",
+		Category: flags.EthCategory,
 	}
 )
 
@@ -63,7 +77,12 @@ var tomlSettings = toml.Config{
 		return field
 	},
 	MissingField: func(rt reflect.Type, field string) error {
-		link := ""
+		id := fmt.Sprintf("%s.%s", rt.String(), field)
+		if deprecatedConfigFields[id] {
+			log.Warn(fmt.Sprintf("Config field '%s' is deprecated and won't have any effect.", id))
+			return nil
+		}
+		var link string
 		if unicode.IsUpper(rune(rt.Name()[0])) && rt.PkgPath() != "main" {
 			link = fmt.Sprintf(", see https://godoc.org/%s#%s for available fields", rt.PkgPath(), rt.Name())
 		}
@@ -71,16 +90,29 @@ var tomlSettings = toml.Config{
 	},
 }
 
+var deprecatedConfigFields = map[string]bool{
+	"ethconfig.Config.EVMInterpreter":          true,
+	"ethconfig.Config.EWASMInterpreter":        true,
+	"ethconfig.Config.TrieCleanCacheJournal":   true,
+	"ethconfig.Config.TrieCleanCacheRejournal": true,
+	"ethconfig.Config.LightServ":               true,
+	"ethconfig.Config.LightIngress":            true,
+	"ethconfig.Config.LightEgress":             true,
+	"ethconfig.Config.LightPeers":              true,
+	"ethconfig.Config.LightNoPrune":            true,
+	"ethconfig.Config.LightNoSyncServe":        true,
+	"ethconfig.Config.EnableStateSizeTracking": true,
+}
+
 type ethstatsConfig struct {
 	URL string `toml:",omitempty"`
 }
 
 type gethConfig struct {
-	Eth       eth.Config
-	Shh       whisper.Config
-	Node      node.Config
-	Ethstats  ethstatsConfig
-	Dashboard dashboard.Config
+	Eth      ethconfig.Config
+	Node     node.Config
+	Ethstats ethstatsConfig
+	Metrics  metrics.Config
 }
 
 func loadConfig(file string, cfg *gethConfig) error {
@@ -99,95 +131,208 @@ func loadConfig(file string, cfg *gethConfig) error {
 }
 
 func defaultNodeConfig() node.Config {
+	git, _ := version.VCS()
 	cfg := node.DefaultConfig
 	cfg.Name = clientIdentifier
-	cfg.Version = params.VersionWithCommit(gitCommit)
-	cfg.HTTPModules = append(cfg.HTTPModules, "eth", "shh")
-	cfg.WSModules = append(cfg.WSModules, "eth", "shh")
-	cfg.IPCPath = "geth.ipc"
+	cfg.Version = version.WithCommit(git.Commit, git.Date)
+	cfg.HTTPModules = append(cfg.HTTPModules, "eth")
+	cfg.WSModules = append(cfg.WSModules, "eth")
+	cfg.IPCPath = clientIdentifier + ".ipc"
 	return cfg
 }
 
-func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
+// loadBaseConfig loads the gethConfig based on the given command line
+// parameters and config file.
+func loadBaseConfig(ctx *cli.Context) gethConfig {
 	// Load defaults.
 	cfg := gethConfig{
-		Eth:       eth.DefaultConfig,
-		Shh:       whisper.DefaultConfig,
-		Node:      defaultNodeConfig(),
-		Dashboard: dashboard.DefaultConfig,
+		Eth:     ethconfig.Defaults,
+		Node:    defaultNodeConfig(),
+		Metrics: metrics.DefaultConfig,
 	}
 
 	// Load config file.
-	if file := ctx.GlobalString(configFileFlag.Name); file != "" {
+	if file := ctx.String(configFileFlag.Name); file != "" {
 		if err := loadConfig(file, &cfg); err != nil {
 			utils.Fatalf("%v", err)
 		}
 	}
 
 	// Apply flags.
-	utils.SetULC(ctx, &cfg.Eth)
 	utils.SetNodeConfig(ctx, &cfg.Node)
+	return cfg
+}
+
+// makeConfigNode loads geth configuration and creates a blank node instance.
+func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
+	cfg := loadBaseConfig(ctx)
 	stack, err := node.New(&cfg.Node)
 	if err != nil {
 		utils.Fatalf("Failed to create the protocol stack: %v", err)
 	}
-	utils.SetEthConfig(ctx, stack, &cfg.Eth)
-	if ctx.GlobalIsSet(utils.EthStatsURLFlag.Name) {
-		cfg.Ethstats.URL = ctx.GlobalString(utils.EthStatsURLFlag.Name)
+	// Node doesn't by default populate account manager backends
+	if err := setAccountManagerBackends(stack.Config(), stack.AccountManager(), stack.KeyStoreDir()); err != nil {
+		utils.Fatalf("Failed to set account manager backends: %v", err)
 	}
 
-	utils.SetShhConfig(ctx, stack, &cfg.Shh)
-	utils.SetDashboardConfig(ctx, &cfg.Dashboard)
+	utils.SetEthConfig(ctx, stack, &cfg.Eth)
+	if ctx.IsSet(utils.EthStatsURLFlag.Name) {
+		cfg.Ethstats.URL = ctx.String(utils.EthStatsURLFlag.Name)
+	}
+	utils.SetMetricsConfig(ctx, &cfg.Metrics)
 
 	return stack, cfg
 }
 
-// enableWhisper returns true in case one of the whisper flags is set.
-func enableWhisper(ctx *cli.Context) bool {
-	for _, flag := range whisperFlags {
-		if ctx.GlobalIsSet(flag.GetName()) {
-			return true
+// constructs the disclaimer text block which will be printed in the logs upon
+// startup when Geth is running in dev mode.
+func constructDevModeBanner(ctx *cli.Context, cfg gethConfig) string {
+	devModeBanner := `You are running Geth in --dev mode. Please note the following:
+
+  1. This mode is only intended for fast, iterative development without assumptions on
+     security or persistence.
+  2. The database is created in memory unless specified otherwise. Therefore, shutting down
+     your computer or losing power will wipe your entire block data and chain state for
+     your dev environment.
+  3. A random, pre-allocated developer account will be available and unlocked as
+     eth.coinbase, which can be used for testing. The random dev account is temporary,
+     stored on a ramdisk, and will be lost if your machine is restarted.
+  4. Mining is enabled by default. However, the client will only seal blocks if transactions
+     are pending in the mempool. The miner's minimum accepted gas price is 1.
+  5. Networking is disabled; there is no listen-address, the maximum number of peers is set
+     to 0, and discovery is disabled.
+`
+	if !ctx.IsSet(utils.DataDirFlag.Name) {
+		devModeBanner += fmt.Sprintf(`
+
+ Running in ephemeral mode.  The following account has been prefunded in the genesis:
+
+       Account
+       ------------------
+       0x%x (10^49 ETH)
+`, cfg.Eth.Miner.PendingFeeRecipient)
+		if cfg.Eth.Miner.PendingFeeRecipient == utils.DeveloperAddr {
+			devModeBanner += fmt.Sprintf(`
+       Private Key
+       ------------------
+       0x%x
+`, crypto.FromECDSA(utils.DeveloperKey))
 		}
 	}
-	return false
+
+	return devModeBanner
 }
 
+// makeFullNode loads geth configuration and creates the Ethereum backend.
 func makeFullNode(ctx *cli.Context) *node.Node {
 	stack, cfg := makeConfigNode(ctx)
-	if ctx.GlobalIsSet(utils.ConstantinopleOverrideFlag.Name) {
-		cfg.Eth.ConstantinopleOverride = new(big.Int).SetUint64(ctx.GlobalUint64(utils.ConstantinopleOverrideFlag.Name))
-	}
-	utils.RegisterEthService(stack, &cfg.Eth)
 
-	if ctx.GlobalBool(utils.DashboardEnabledFlag.Name) {
-		utils.RegisterDashboardService(stack, &cfg.Dashboard, gitCommit)
+	// The initialization of the KZG library can take up to 2 seconds
+	// We start this here in parallel, so it should be available
+	// once we start executing blocks. It's threadsafe.
+	if !ctx.Bool(utils.CryptoKZGLazyFlag.Name) {
+		go func() {
+			log.Info("Initializing the KZG library", "backend", ctx.String(utils.CryptoKZGFlag.Name))
+			kzg4844.Warmup()
+		}()
 	}
-	// Whisper must be explicitly enabled by specifying at least 1 whisper flag or in dev mode
-	shhEnabled := enableWhisper(ctx)
-	shhAutoEnabled := !ctx.GlobalIsSet(utils.WhisperEnabledFlag.Name) && ctx.GlobalIsSet(utils.DeveloperFlag.Name)
-	if shhEnabled || shhAutoEnabled {
-		if ctx.GlobalIsSet(utils.WhisperMaxMessageSizeFlag.Name) {
-			cfg.Shh.MaxMessageSize = uint32(ctx.Int(utils.WhisperMaxMessageSizeFlag.Name))
-		}
-		if ctx.GlobalIsSet(utils.WhisperMinPOWFlag.Name) {
-			cfg.Shh.MinimumAcceptedPOW = ctx.Float64(utils.WhisperMinPOWFlag.Name)
-		}
-		if ctx.GlobalIsSet(utils.WhisperRestrictConnectionBetweenLightClientsFlag.Name) {
-			cfg.Shh.RestrictConnectionBetweenLightClients = true
-		}
-		utils.RegisterShhService(stack, &cfg.Shh)
+	if ctx.IsSet(utils.OverrideOsaka.Name) {
+		v := ctx.Uint64(utils.OverrideOsaka.Name)
+		cfg.Eth.OverrideOsaka = &v
+	}
+	if ctx.IsSet(utils.OverrideAmsterdam.Name) {
+		v := ctx.Uint64(utils.OverrideAmsterdam.Name)
+		cfg.Eth.OverrideAmsterdam = &v
+	}
+	if ctx.IsSet(utils.OverrideBPO1.Name) {
+		v := ctx.Uint64(utils.OverrideBPO1.Name)
+		cfg.Eth.OverrideBPO1 = &v
+	}
+	if ctx.IsSet(utils.OverrideBPO2.Name) {
+		v := ctx.Uint64(utils.OverrideBPO2.Name)
+		cfg.Eth.OverrideBPO2 = &v
+	}
+	if ctx.IsSet(utils.OverrideUBT.Name) {
+		v := ctx.Uint64(utils.OverrideUBT.Name)
+		cfg.Eth.OverrideUBT = &v
 	}
 
-	// Configure GraphQL if required
-	if ctx.GlobalIsSet(utils.GraphQLEnabledFlag.Name) {
-		if err := graphql.RegisterGraphQLService(stack, cfg.Node.GraphQLEndpoint(), cfg.Node.GraphQLCors, cfg.Node.GraphQLVirtualHosts, cfg.Node.HTTPTimeouts); err != nil {
-			utils.Fatalf("Failed to register the Ethereum service: %v", err)
-		}
+	// Start metrics export if enabled.
+	utils.SetupMetrics(&cfg.Metrics)
+
+	// Setup OpenTelemetry reporting if enabled.
+	if err := tracesetup.SetupTelemetry(cfg.Node.OpenTelemetry, stack); err != nil {
+		utils.Fatalf("failed to setup OpenTelemetry: %v", err)
 	}
 
+	// Add Ethereum service.
+	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
+
+	// Create gauge with geth system and build information
+	if eth != nil { // The 'eth' backend may be nil in light mode
+		var protos []string
+		for _, p := range eth.Protocols() {
+			protos = append(protos, fmt.Sprintf("%v/%d", p.Name, p.Version))
+		}
+		metrics.NewRegisteredGaugeInfo("geth/info", nil).Update(metrics.GaugeInfoValue{
+			"arch":      runtime.GOARCH,
+			"os":        runtime.GOOS,
+			"version":   cfg.Node.Version,
+			"protocols": strings.Join(protos, ","),
+		})
+	}
+
+	// Configure log filter RPC API.
+	filterSystem := utils.RegisterFilterAPI(stack, backend, &cfg.Eth)
+
+	// Configure GraphQL if requested.
+	if ctx.Bool(utils.GraphQLEnabledFlag.Name) {
+		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
+	}
 	// Add the Ethereum Stats daemon if requested.
 	if cfg.Ethstats.URL != "" {
-		utils.RegisterEthStatsService(stack, cfg.Ethstats.URL)
+		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
+	}
+
+	// Configure synchronization override service
+	syncConfig := syncer.Config{
+		ExitWhenSynced: ctx.Bool(utils.ExitWhenSyncedFlag.Name),
+	}
+	if ctx.IsSet(utils.SyncTargetFlag.Name) {
+		target := ctx.String(utils.SyncTargetFlag.Name)
+		if !common.IsHexHash(target) {
+			utils.Fatalf("sync target hash is not a valid hex hash: %s", target)
+		}
+		syncConfig.TargetBlock = common.HexToHash(target)
+	}
+	utils.RegisterSyncOverrideService(stack, eth, syncConfig)
+
+	if ctx.Bool(utils.DeveloperFlag.Name) {
+		// Start dev mode.
+		simBeacon, err := catalyst.NewSimulatedBeacon(ctx.Uint64(utils.DeveloperPeriodFlag.Name), cfg.Eth.Miner.PendingFeeRecipient, eth)
+		if err != nil {
+			utils.Fatalf("failed to register dev mode catalyst service: %v", err)
+		}
+		catalyst.RegisterSimulatedBeaconAPIs(stack, simBeacon)
+		stack.RegisterLifecycle(simBeacon)
+
+		banner := constructDevModeBanner(ctx, cfg)
+		for _, line := range strings.Split(banner, "\n") {
+			log.Warn(line)
+		}
+	} else if ctx.IsSet(utils.BeaconApiFlag.Name) {
+		// Start blsync mode.
+		srv := rpc.NewServer()
+		srv.RegisterName("engine", catalyst.NewConsensusAPI(eth))
+		blsyncer := blsync.NewClient(utils.MakeBeaconLightConfig(ctx))
+		blsyncer.SetEngineRPC(rpc.DialInProc(srv))
+		stack.RegisterLifecycle(blsyncer)
+	} else {
+		// Launch the engine API for interacting with external consensus client.
+		err := catalyst.Register(stack, eth)
+		if err != nil {
+			utils.Fatalf("failed to register catalyst service: %v", err)
+		}
 	}
 	return stack
 }
@@ -217,6 +362,62 @@ func dumpConfig(ctx *cli.Context) error {
 	}
 	dump.WriteString(comment)
 	dump.Write(out)
+
+	return nil
+}
+
+func setAccountManagerBackends(conf *node.Config, am *accounts.Manager, keydir string) error {
+	scryptN := keystore.StandardScryptN
+	scryptP := keystore.StandardScryptP
+	if conf.UseLightweightKDF {
+		scryptN = keystore.LightScryptN
+		scryptP = keystore.LightScryptP
+	}
+
+	// Assemble the supported backends
+	if len(conf.ExternalSigner) > 0 {
+		log.Info("Using external signer", "url", conf.ExternalSigner)
+		if extBackend, err := external.NewExternalBackend(conf.ExternalSigner); err == nil {
+			am.AddBackend(extBackend)
+			return nil
+		} else {
+			return fmt.Errorf("error connecting to external signer: %v", err)
+		}
+	}
+
+	// For now, we're using EITHER external signer OR local signers.
+	// If/when we implement some form of lockfile for USB and keystore wallets,
+	// we can have both, but it's very confusing for the user to see the same
+	// accounts in both externally and locally, plus very racey.
+	am.AddBackend(keystore.NewKeyStore(keydir, scryptN, scryptP))
+	if conf.USB {
+		// Start a USB hub for Ledger hardware wallets
+		if ledgerhub, err := usbwallet.NewLedgerHub(); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start Ledger hub, disabling: %v", err))
+		} else {
+			am.AddBackend(ledgerhub)
+		}
+		// Start a USB hub for Trezor hardware wallets (HID version)
+		if trezorhub, err := usbwallet.NewTrezorHubWithHID(); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start HID Trezor hub, disabling: %v", err))
+		} else {
+			am.AddBackend(trezorhub)
+		}
+		// Start a USB hub for Trezor hardware wallets (WebUSB version)
+		if trezorhub, err := usbwallet.NewTrezorHubWithWebUSB(); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start WebUSB Trezor hub, disabling: %v", err))
+		} else {
+			am.AddBackend(trezorhub)
+		}
+	}
+	if len(conf.SmartCardDaemonPath) > 0 {
+		// Start a smart card hub
+		if schub, err := scwallet.NewHub(conf.SmartCardDaemonPath, scwallet.Scheme, keydir); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start smart card hub, disabling: %v", err))
+		} else {
+			am.AddBackend(schub)
+		}
+	}
 
 	return nil
 }

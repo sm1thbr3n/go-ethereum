@@ -17,7 +17,9 @@
 package p2p
 
 import (
+	"cmp"
 	"fmt"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -35,6 +37,9 @@ type Protocol struct {
 	// Length should contain the number of message codes used
 	// by the protocol.
 	Length uint64
+
+	// AllowBrowser indicates the protocol may run on anonymous browser connections.
+	AllowBrowser bool
 
 	// Run is called in a new goroutine when the protocol has been
 	// negotiated with a peer. It should read and write messages from
@@ -54,12 +59,28 @@ type Protocol struct {
 	// but returns nil, it is assumed that the protocol handshake is still running.
 	PeerInfo func(id enode.ID) interface{}
 
+	// DialCandidates, if non-nil, is a way to tell Server about protocol-specific nodes
+	// that should be dialed. The server continuously reads nodes from the iterator and
+	// attempts to create connections to them.
+	DialCandidates enode.Iterator
+
 	// Attributes contains protocol specific information for the node record.
 	Attributes []enr.Entry
 }
 
 func (p Protocol) cap() Cap {
 	return Cap{p.Name, p.Version}
+}
+
+// filterProtocols returns the protocols where AllowBrowser matches.
+func filterProtocols(protos []Protocol, browser bool) []Protocol {
+	var allowed []Protocol
+	for _, p := range protos {
+		if p.AllowBrowser == browser {
+			allowed = append(allowed, p)
+		}
+	}
+	return allowed
 }
 
 // Cap is the structure of a peer capability.
@@ -72,12 +93,10 @@ func (cap Cap) String() string {
 	return fmt.Sprintf("%s/%d", cap.Name, cap.Version)
 }
 
-type capsByNameAndVersion []Cap
-
-func (cs capsByNameAndVersion) Len() int      { return len(cs) }
-func (cs capsByNameAndVersion) Swap(i, j int) { cs[i], cs[j] = cs[j], cs[i] }
-func (cs capsByNameAndVersion) Less(i, j int) bool {
-	return cs[i].Name < cs[j].Name || (cs[i].Name == cs[j].Name && cs[i].Version < cs[j].Version)
+// Cmp defines the canonical sorting order of capabilities.
+func (cap Cap) Cmp(other Cap) int {
+	if cap.Name == other.Name {
+		return cmp.Compare(cap.Version, other.Version)
+	}
+	return strings.Compare(cap.Name, other.Name)
 }
-
-func (capsByNameAndVersion) ENRKey() string { return "cap" }

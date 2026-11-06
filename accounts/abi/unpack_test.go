@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -29,6 +30,73 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/require"
 )
+
+func BenchmarkUnpack(b *testing.B) {
+	testCases := []struct {
+		def    string
+		packed string
+	}{
+		{
+			def:    `[{"type": "uint32"}]`,
+			packed: "0000000000000000000000000000000000000000000000000000000000000001",
+		},
+		{
+			def: `[{"type": "uint32[]"}]`,
+			packed: "0000000000000000000000000000000000000000000000000000000000000020" +
+				"0000000000000000000000000000000000000000000000000000000000000002" +
+				"0000000000000000000000000000000000000000000000000000000000000001" +
+				"0000000000000000000000000000000000000000000000000000000000000002",
+		},
+	}
+	for i, test := range testCases {
+		b.Run(strconv.Itoa(i), func(b *testing.B) {
+			def := fmt.Sprintf(`[{ "name" : "method", "type": "function", "outputs": %s}]`, test.def)
+			abi, err := JSON(strings.NewReader(def))
+			if err != nil {
+				b.Fatalf("invalid ABI definition %s: %v", def, err)
+			}
+			encb, err := hex.DecodeString(test.packed)
+			if err != nil {
+				b.Fatalf("invalid hex %s: %v", test.packed, err)
+			}
+
+			b.ResetTimer()
+
+			var result any
+			for range b.N {
+				result, _ = abi.Unpack("method", encb)
+			}
+			_ = result
+		})
+	}
+}
+
+// TestUnpack tests the general pack/unpack tests in packing_test.go
+func TestUnpack(t *testing.T) {
+	t.Parallel()
+	for i, test := range packUnpackTests {
+		t.Run(strconv.Itoa(i)+" "+test.def, func(t *testing.T) {
+			//Unpack
+			def := fmt.Sprintf(`[{ "name" : "method", "type": "function", "outputs": %s}]`, test.def)
+			abi, err := JSON(strings.NewReader(def))
+			if err != nil {
+				t.Fatalf("invalid ABI definition %s: %v", def, err)
+			}
+			encb, err := hex.DecodeString(test.packed)
+			if err != nil {
+				t.Fatalf("invalid hex %s: %v", test.packed, err)
+			}
+			out, err := abi.Unpack("method", encb)
+			if err != nil {
+				t.Errorf("test %d (%v) failed: %v", i, test.def, err)
+				return
+			}
+			if !reflect.DeepEqual(test.unpacked, ConvertType(out[0], test.unpacked)) {
+				t.Errorf("test %d (%v) failed: expected %v, got %v", i, test.def, test.unpacked, out[0])
+			}
+		})
+	}
+}
 
 type unpackTest struct {
 	def  string      // ABI definition JSON
@@ -51,16 +119,7 @@ func (test unpackTest) checkError(err error) error {
 }
 
 var unpackTests = []unpackTest{
-	{
-		def:  `[{ "type": "bool" }]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
-		want: true,
-	},
-	{
-		def:  `[{ "type": "bool" }]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000000",
-		want: false,
-	},
+	// Bools
 	{
 		def:  `[{ "type": "bool" }]`,
 		enc:  "0000000000000000000000000000000000000000000000000001000000000001",
@@ -73,11 +132,7 @@ var unpackTests = []unpackTest{
 		want: false,
 		err:  "abi: improperly encoded boolean value",
 	},
-	{
-		def:  `[{"type": "uint32"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
-		want: uint32(1),
-	},
+	// Integers
 	{
 		def:  `[{"type": "uint32"}]`,
 		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
@@ -89,16 +144,6 @@ var unpackTests = []unpackTest{
 		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
 		want: uint16(0),
 		err:  "abi: cannot unmarshal *big.Int in to uint16",
-	},
-	{
-		def:  `[{"type": "uint17"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
-		want: big.NewInt(1),
-	},
-	{
-		def:  `[{"type": "int32"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
-		want: int32(1),
 	},
 	{
 		def:  `[{"type": "int32"}]`,
@@ -113,35 +158,9 @@ var unpackTests = []unpackTest{
 		err:  "abi: cannot unmarshal *big.Int in to int16",
 	},
 	{
-		def:  `[{"type": "int17"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001",
-		want: big.NewInt(1),
-	},
-	{
-		def:  `[{"type": "int256"}]`,
-		enc:  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-		want: big.NewInt(-1),
-	},
-	{
-		def:  `[{"type": "address"}]`,
-		enc:  "0000000000000000000000000100000000000000000000000000000000000000",
-		want: common.Address{1},
-	},
-	{
-		def:  `[{"type": "bytes32"}]`,
-		enc:  "0100000000000000000000000000000000000000000000000000000000000000",
-		want: [32]byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	},
-	{
 		def:  `[{"type": "bytes"}]`,
 		enc:  "000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000200100000000000000000000000000000000000000000000000000000000000000",
-		want: common.Hex2Bytes("0100000000000000000000000000000000000000000000000000000000000000"),
-	},
-	{
-		def:  `[{"type": "bytes"}]`,
-		enc:  "000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000200100000000000000000000000000000000000000000000000000000000000000",
-		want: [32]byte{},
-		err:  "abi: cannot unmarshal []uint8 in to [32]uint8",
+		want: [32]byte{1},
 	},
 	{
 		def:  `[{"type": "bytes32"}]`,
@@ -150,218 +169,12 @@ var unpackTests = []unpackTest{
 		err:  "abi: cannot unmarshal [32]uint8 in to []uint8",
 	},
 	{
-		def:  `[{"type": "bytes32"}]`,
-		enc:  "0100000000000000000000000000000000000000000000000000000000000000",
-		want: [32]byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	},
-	{
-		def:  `[{"type": "function"}]`,
-		enc:  "0100000000000000000000000000000000000000000000000000000000000000",
-		want: [24]byte{1},
-	},
-	// slices
-	{
-		def:  `[{"type": "uint8[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []uint8{1, 2},
-	},
-	{
-		def:  `[{"type": "uint8[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]uint8{1, 2},
-	},
-	// multi dimensional, if these pass, all types that don't require length prefix should pass
-	{
-		def:  `[{"type": "uint8[][]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [][]uint8{{1, 2}, {1, 2}},
-	},
-	{
-		def:  `[{"type": "uint8[][]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003",
-		want: [][]uint8{{1, 2}, {1, 2, 3}},
-	},
-	{
-		def:  `[{"type": "uint8[2][2]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2][2]uint8{{1, 2}, {1, 2}},
-	},
-	{
-		def:  `[{"type": "uint8[][2]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001",
-		want: [2][]uint8{{1}, {1}},
-	},
-	{
-		def:  `[{"type": "uint8[2][]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [][2]uint8{{1, 2}},
-	},
-	{
-		def:  `[{"type": "uint8[2][]"}]`,
-		enc:  "000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [][2]uint8{{1, 2}, {1, 2}},
-	},
-	{
-		def:  `[{"type": "uint16[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []uint16{1, 2},
-	},
-	{
-		def:  `[{"type": "uint16[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]uint16{1, 2},
-	},
-	{
-		def:  `[{"type": "uint32[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []uint32{1, 2},
-	},
-	{
-		def:  `[{"type": "uint32[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]uint32{1, 2},
-	},
-	{
-		def:  `[{"type": "uint32[2][3][4]"}]`,
-		enc:  "000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000050000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000009000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000b000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000d000000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000f000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000001300000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000015000000000000000000000000000000000000000000000000000000000000001600000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000018",
-		want: [4][3][2]uint32{{{1, 2}, {3, 4}, {5, 6}}, {{7, 8}, {9, 10}, {11, 12}}, {{13, 14}, {15, 16}, {17, 18}}, {{19, 20}, {21, 22}, {23, 24}}},
-	},
-	{
-		def:  `[{"type": "uint64[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []uint64{1, 2},
-	},
-	{
-		def:  `[{"type": "uint64[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]uint64{1, 2},
-	},
-	{
-		def:  `[{"type": "uint256[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []*big.Int{big.NewInt(1), big.NewInt(2)},
-	},
-	{
-		def:  `[{"type": "uint256[3]"}]`,
-		enc:  "000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003",
-		want: [3]*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)},
-	},
-	{
-		def:  `[{"type": "string[4]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000000548656c6c6f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005576f726c64000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b476f2d657468657265756d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008457468657265756d000000000000000000000000000000000000000000000000",
-		want: [4]string{"Hello", "World", "Go-ethereum", "Ethereum"},
-	},
-	{
-		def:  `[{"type": "string[]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000008457468657265756d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b676f2d657468657265756d000000000000000000000000000000000000000000",
-		want: []string{"Ethereum", "go-ethereum"},
-	},
-	{
-		def:  `[{"type": "bytes[]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000003f0f0f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003f0f0f00000000000000000000000000000000000000000000000000000000000",
-		want: [][]byte{{0xf0, 0xf0, 0xf0}, {0xf0, 0xf0, 0xf0}},
-	},
-	{
-		def:  `[{"type": "uint256[2][][]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000c8000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000003e80000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000c8000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000003e8",
-		want: [][][2]*big.Int{{{big.NewInt(1), big.NewInt(200)}, {big.NewInt(1), big.NewInt(1000)}}, {{big.NewInt(1), big.NewInt(200)}, {big.NewInt(1), big.NewInt(1000)}}},
-	},
-	{
-		def:  `[{"type": "int8[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []int8{1, 2},
-	},
-	{
-		def:  `[{"type": "int8[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]int8{1, 2},
-	},
-	{
-		def:  `[{"type": "int16[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []int16{1, 2},
-	},
-	{
-		def:  `[{"type": "int16[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]int16{1, 2},
-	},
-	{
-		def:  `[{"type": "int32[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []int32{1, 2},
-	},
-	{
-		def:  `[{"type": "int32[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]int32{1, 2},
-	},
-	{
-		def:  `[{"type": "int64[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []int64{1, 2},
-	},
-	{
-		def:  `[{"type": "int64[2]"}]`,
-		enc:  "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: [2]int64{1, 2},
-	},
-	{
-		def:  `[{"type": "int256[]"}]`,
-		enc:  "0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: []*big.Int{big.NewInt(1), big.NewInt(2)},
-	},
-	{
-		def:  `[{"type": "int256[3]"}]`,
-		enc:  "000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003",
-		want: [3]*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)},
-	},
-	// struct outputs
-	{
-		def: `[{"name":"int1","type":"int256"},{"name":"int2","type":"int256"}]`,
-		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: struct {
-			Int1 *big.Int
-			Int2 *big.Int
-		}{big.NewInt(1), big.NewInt(2)},
-	},
-	{
-		def: `[{"name":"int_one","type":"int256"}]`,
-		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: struct {
-			IntOne *big.Int
-		}{big.NewInt(1)},
-	},
-	{
-		def: `[{"name":"int__one","type":"int256"}]`,
-		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: struct {
-			IntOne *big.Int
-		}{big.NewInt(1)},
-	},
-	{
-		def: `[{"name":"int_one_","type":"int256"}]`,
-		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: struct {
-			IntOne *big.Int
-		}{big.NewInt(1)},
-	},
-	{
-		def: `[{"name":"int_one","type":"int256"}, {"name":"intone","type":"int256"}]`,
-		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
-		want: struct {
-			IntOne *big.Int
-			Intone *big.Int
-		}{big.NewInt(1), big.NewInt(2)},
-	},
-	{
 		def: `[{"name":"___","type":"int256"}]`,
 		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
 		want: struct {
 			IntOne *big.Int
 			Intone *big.Int
-		}{},
-		err: "abi: purely underscored output cannot unpack to struct",
+		}{IntOne: big.NewInt(1)},
 	},
 	{
 		def: `[{"name":"int_one","type":"int256"},{"name":"IntOne","type":"int256"}]`,
@@ -408,22 +221,65 @@ var unpackTests = []unpackTest{
 		}{},
 		err: "abi: purely underscored output cannot unpack to struct",
 	},
+	// Make sure only the first argument is consumed
+	{
+		def: `[{"name":"int_one","type":"int256"}]`,
+		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
+		want: struct {
+			IntOne *big.Int
+		}{big.NewInt(1)},
+	},
+	{
+		def: `[{"name":"int__one","type":"int256"}]`,
+		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
+		want: struct {
+			IntOne *big.Int
+		}{big.NewInt(1)},
+	},
+	{
+		def: `[{"name":"int_one_","type":"int256"}]`,
+		enc: "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002",
+		want: struct {
+			IntOne *big.Int
+		}{big.NewInt(1)},
+	},
+	{
+		def:  `[{"type":"bool"}]`,
+		enc:  "",
+		want: false,
+		err:  "abi: attempting to unmarshal an empty string while arguments are expected",
+	},
+	{
+		def:  `[{"type":"bytes32","indexed":true},{"type":"uint256","indexed":false}]`,
+		enc:  "",
+		want: false,
+		err:  "abi: attempting to unmarshal an empty string while arguments are expected",
+	},
+	{
+		def:  `[{"type":"bool","indexed":true},{"type":"uint64","indexed":true}]`,
+		enc:  "",
+		want: false,
+	},
 }
 
-func TestUnpack(t *testing.T) {
+// TestLocalUnpackTests runs test specially designed only for unpacking.
+// All test cases that can be used to test packing and unpacking should move to packing_test.go
+func TestLocalUnpackTests(t *testing.T) {
+	t.Parallel()
 	for i, test := range unpackTests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			def := fmt.Sprintf(`[{ "name" : "method", "outputs": %s}]`, test.def)
+			//Unpack
+			def := fmt.Sprintf(`[{ "name" : "method", "type": "function", "outputs": %s}]`, test.def)
 			abi, err := JSON(strings.NewReader(def))
 			if err != nil {
 				t.Fatalf("invalid ABI definition %s: %v", def, err)
 			}
 			encb, err := hex.DecodeString(test.enc)
 			if err != nil {
-				t.Fatalf("invalid hex: %s" + test.enc)
+				t.Fatalf("invalid hex %s: %v", test.enc, err)
 			}
 			outptr := reflect.New(reflect.TypeOf(test.want))
-			err = abi.Unpack(outptr.Interface(), "method", encb)
+			err = abi.UnpackIntoInterface(outptr.Interface(), "method", encb)
 			if err := test.checkError(err); err != nil {
 				t.Errorf("test %d (%v) failed: %v", i, test.def, err)
 				return
@@ -436,7 +292,8 @@ func TestUnpack(t *testing.T) {
 	}
 }
 
-func TestUnpackSetDynamicArrayOutput(t *testing.T) {
+func TestUnpackIntoInterfaceSetDynamicArrayOutput(t *testing.T) {
+	t.Parallel()
 	abi, err := JSON(strings.NewReader(`[{"constant":true,"inputs":[],"name":"testDynamicFixedBytes15","outputs":[{"name":"","type":"bytes15[]"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"testDynamicFixedBytes32","outputs":[{"name":"","type":"bytes32[]"}],"payable":false,"stateMutability":"view","type":"function"}]`))
 	if err != nil {
 		t.Fatal(err)
@@ -451,7 +308,7 @@ func TestUnpackSetDynamicArrayOutput(t *testing.T) {
 	)
 
 	// test 32
-	err = abi.Unpack(&out32, "testDynamicFixedBytes32", marshalledReturn32)
+	err = abi.UnpackIntoInterface(&out32, "testDynamicFixedBytes32", marshalledReturn32)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +325,7 @@ func TestUnpackSetDynamicArrayOutput(t *testing.T) {
 	}
 
 	// test 15
-	err = abi.Unpack(&out15, "testDynamicFixedBytes32", marshalledReturn15)
+	err = abi.UnpackIntoInterface(&out15, "testDynamicFixedBytes32", marshalledReturn15)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +349,7 @@ type methodMultiOutput struct {
 
 func methodMultiReturn(require *require.Assertions) (ABI, []byte, methodMultiOutput) {
 	const definition = `[
-	{ "name" : "multi", "constant" : false, "outputs": [ { "name": "Int", "type": "uint256" }, { "name": "String", "type": "string" } ] }]`
+	{ "name" : "multi", "type": "function", "outputs": [ { "name": "Int", "type": "uint256" }, { "name": "String", "type": "string" } ] }]`
 	var expected = methodMultiOutput{big.NewInt(1), "hello"}
 
 	abi, err := JSON(strings.NewReader(definition))
@@ -507,6 +364,7 @@ func methodMultiReturn(require *require.Assertions) (ABI, []byte, methodMultiOut
 }
 
 func TestMethodMultiReturn(t *testing.T) {
+	t.Parallel()
 	type reversed struct {
 		String string
 		Int    *big.Int
@@ -540,6 +398,11 @@ func TestMethodMultiReturn(t *testing.T) {
 		"",
 		"Can unpack into a slice",
 	}, {
+		&[]interface{}{&bigint, ""},
+		&[]interface{}{&expected.Int, expected.String},
+		"",
+		"Can unpack into a slice without indirection",
+	}, {
 		&[2]interface{}{&bigint, new(string)},
 		&[2]interface{}{&expected.Int, &expected.String},
 		"",
@@ -562,14 +425,13 @@ func TestMethodMultiReturn(t *testing.T) {
 	}, {
 		&[]interface{}{new(int)},
 		&[]interface{}{},
-		"abi: insufficient number of elements in the list/array for unpack, want 2, got 1",
+		"abi: insufficient number of arguments for unpack, want 2, got 1",
 		"Can not unpack into a slice with wrong types",
 	}}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			require := require.New(t)
-			err := abi.Unpack(tc.dest, "multi", data)
+			err := abi.UnpackIntoInterface(tc.dest, "multi", data)
 			if tc.error == "" {
 				require.Nil(err, "Should be able to unpack method outputs.")
 				require.Equal(tc.expected, tc.dest)
@@ -581,7 +443,8 @@ func TestMethodMultiReturn(t *testing.T) {
 }
 
 func TestMultiReturnWithArray(t *testing.T) {
-	const definition = `[{"name" : "multi", "outputs": [{"type": "uint64[3]"}, {"type": "uint64"}]}]`
+	t.Parallel()
+	const definition = `[{"name" : "multi", "type": "function", "outputs": [{"type": "uint64[3]"}, {"type": "uint64"}]}]`
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
 		t.Fatal(err)
@@ -592,7 +455,7 @@ func TestMultiReturnWithArray(t *testing.T) {
 
 	ret1, ret1Exp := new([3]uint64), [3]uint64{9, 9, 9}
 	ret2, ret2Exp := new(uint64), uint64(8)
-	if err := abi.Unpack(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
+	if err := abi.UnpackIntoInterface(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(*ret1, ret1Exp) {
@@ -604,19 +467,20 @@ func TestMultiReturnWithArray(t *testing.T) {
 }
 
 func TestMultiReturnWithStringArray(t *testing.T) {
-	const definition = `[{"name" : "multi", "outputs": [{"name": "","type": "uint256[3]"},{"name": "","type": "address"},{"name": "","type": "string[2]"},{"name": "","type": "bool"}]}]`
+	t.Parallel()
+	const definition = `[{"name" : "multi", "type": "function", "outputs": [{"name": "","type": "uint256[3]"},{"name": "","type": "address"},{"name": "","type": "string[2]"},{"name": "","type": "bool"}]}]`
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
 		t.Fatal(err)
 	}
 	buff := new(bytes.Buffer)
 	buff.Write(common.Hex2Bytes("000000000000000000000000000000000000000000000000000000005c1b78ea0000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000001a055690d9db80000000000000000000000000000ab1257528b3782fb40d7ed5f72e624b744dffb2f00000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000008457468657265756d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001048656c6c6f2c20457468657265756d2100000000000000000000000000000000"))
-	temp, _ := big.NewInt(0).SetString("30000000000000000000", 10)
+	temp, _ := new(big.Int).SetString("30000000000000000000", 10)
 	ret1, ret1Exp := new([3]*big.Int), [3]*big.Int{big.NewInt(1545304298), big.NewInt(6), temp}
 	ret2, ret2Exp := new(common.Address), common.HexToAddress("ab1257528b3782fb40d7ed5f72e624b744dffb2f")
 	ret3, ret3Exp := new([2]string), [2]string{"Ethereum", "Hello, Ethereum!"}
 	ret4, ret4Exp := new(bool), false
-	if err := abi.Unpack(&[]interface{}{ret1, ret2, ret3, ret4}, "multi", buff.Bytes()); err != nil {
+	if err := abi.UnpackIntoInterface(&[]interface{}{ret1, ret2, ret3, ret4}, "multi", buff.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(*ret1, ret1Exp) {
@@ -634,7 +498,8 @@ func TestMultiReturnWithStringArray(t *testing.T) {
 }
 
 func TestMultiReturnWithStringSlice(t *testing.T) {
-	const definition = `[{"name" : "multi", "outputs": [{"name": "","type": "string[]"},{"name": "","type": "uint256[]"}]}]`
+	t.Parallel()
+	const definition = `[{"name" : "multi", "type": "function", "outputs": [{"name": "","type": "string[]"},{"name": "","type": "uint256[]"}]}]`
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
 		t.Fatal(err)
@@ -654,7 +519,7 @@ func TestMultiReturnWithStringSlice(t *testing.T) {
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000065")) // output[1][1] value
 	ret1, ret1Exp := new([]string), []string{"ethereum", "go-ethereum"}
 	ret2, ret2Exp := new([]*big.Int), []*big.Int{big.NewInt(100), big.NewInt(101)}
-	if err := abi.Unpack(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
+	if err := abi.UnpackIntoInterface(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(*ret1, ret1Exp) {
@@ -666,11 +531,12 @@ func TestMultiReturnWithStringSlice(t *testing.T) {
 }
 
 func TestMultiReturnWithDeeplyNestedArray(t *testing.T) {
+	t.Parallel()
 	// Similar to TestMultiReturnWithArray, but with a special case in mind:
 	//  values of nested static arrays count towards the size as well, and any element following
 	//  after such nested array argument should be read with the correct offset,
 	//  so that it does not read content from the previous array argument.
-	const definition = `[{"name" : "multi", "outputs": [{"type": "uint64[3][2][4]"}, {"type": "uint64"}]}]`
+	const definition = `[{"name" : "multi", "type": "function", "outputs": [{"type": "uint64[3][2][4]"}, {"type": "uint64"}]}]`
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
 		t.Fatal(err)
@@ -694,7 +560,7 @@ func TestMultiReturnWithDeeplyNestedArray(t *testing.T) {
 		{{0x411, 0x412, 0x413}, {0x421, 0x422, 0x423}},
 	}
 	ret2, ret2Exp := new(uint64), uint64(0x9876)
-	if err := abi.Unpack(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
+	if err := abi.UnpackIntoInterface(&[]interface{}{ret1, ret2}, "multi", buff.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(*ret1, ret1Exp) {
@@ -706,16 +572,17 @@ func TestMultiReturnWithDeeplyNestedArray(t *testing.T) {
 }
 
 func TestUnmarshal(t *testing.T) {
+	t.Parallel()
 	const definition = `[
-	{ "name" : "int", "constant" : false, "outputs": [ { "type": "uint256" } ] },
-	{ "name" : "bool", "constant" : false, "outputs": [ { "type": "bool" } ] },
-	{ "name" : "bytes", "constant" : false, "outputs": [ { "type": "bytes" } ] },
-	{ "name" : "fixed", "constant" : false, "outputs": [ { "type": "bytes32" } ] },
-	{ "name" : "multi", "constant" : false, "outputs": [ { "type": "bytes" }, { "type": "bytes" } ] },
-	{ "name" : "intArraySingle", "constant" : false, "outputs": [ { "type": "uint256[3]" } ] },
-	{ "name" : "addressSliceSingle", "constant" : false, "outputs": [ { "type": "address[]" } ] },
-	{ "name" : "addressSliceDouble", "constant" : false, "outputs": [ { "name": "a", "type": "address[]" }, { "name": "b", "type": "address[]" } ] },
-	{ "name" : "mixedBytes", "constant" : true, "outputs": [ { "name": "a", "type": "bytes" }, { "name": "b", "type": "bytes32" } ] }]`
+	{ "name" : "int", "type": "function", "outputs": [ { "type": "uint256" } ] },
+	{ "name" : "bool", "type": "function", "outputs": [ { "type": "bool" } ] },
+	{ "name" : "bytes", "type": "function", "outputs": [ { "type": "bytes" } ] },
+	{ "name" : "fixed", "type": "function", "outputs": [ { "type": "bytes32" } ] },
+	{ "name" : "multi", "type": "function", "outputs": [ { "type": "bytes" }, { "type": "bytes" } ] },
+	{ "name" : "intArraySingle", "type": "function", "outputs": [ { "type": "uint256[3]" } ] },
+	{ "name" : "addressSliceSingle", "type": "function", "outputs": [ { "type": "address[]" } ] },
+	{ "name" : "addressSliceDouble", "type": "function", "outputs": [ { "name": "a", "type": "address[]" }, { "name": "b", "type": "address[]" } ] },
+	{ "name" : "mixedBytes", "type": "function", "stateMutability" : "view", "outputs": [ { "name": "a", "type": "bytes" }, { "name": "b", "type": "bytes32" } ] }]`
 
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
@@ -733,7 +600,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(common.Hex2Bytes("000000000000000000000000000000000000000000000000000000000000000a"))
 	buff.Write(common.Hex2Bytes("0102000000000000000000000000000000000000000000000000000000000000"))
 
-	err = abi.Unpack(&mixedBytes, "mixedBytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&mixedBytes, "mixedBytes", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	} else {
@@ -748,7 +615,7 @@ func TestUnmarshal(t *testing.T) {
 
 	// marshal int
 	var Int *big.Int
-	err = abi.Unpack(&Int, "int", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
+	err = abi.UnpackIntoInterface(&Int, "int", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
 	if err != nil {
 		t.Error(err)
 	}
@@ -759,7 +626,7 @@ func TestUnmarshal(t *testing.T) {
 
 	// marshal bool
 	var Bool bool
-	err = abi.Unpack(&Bool, "bool", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
+	err = abi.UnpackIntoInterface(&Bool, "bool", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
 	if err != nil {
 		t.Error(err)
 	}
@@ -776,7 +643,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(bytesOut)
 
 	var Bytes []byte
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -792,7 +659,7 @@ func TestUnmarshal(t *testing.T) {
 	bytesOut = common.RightPadBytes([]byte("hello"), 64)
 	buff.Write(bytesOut)
 
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -808,7 +675,7 @@ func TestUnmarshal(t *testing.T) {
 	bytesOut = common.RightPadBytes([]byte("hello"), 64)
 	buff.Write(bytesOut)
 
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -818,7 +685,7 @@ func TestUnmarshal(t *testing.T) {
 	}
 
 	// marshal dynamic bytes output empty
-	err = abi.Unpack(&Bytes, "bytes", nil)
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", nil)
 	if err == nil {
 		t.Error("expected error")
 	}
@@ -829,7 +696,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000005"))
 	buff.Write(common.RightPadBytes([]byte("hello"), 32))
 
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -843,7 +710,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(common.RightPadBytes([]byte("hello"), 32))
 
 	var hash common.Hash
-	err = abi.Unpack(&hash, "fixed", buff.Bytes())
+	err = abi.UnpackIntoInterface(&hash, "fixed", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -856,12 +723,12 @@ func TestUnmarshal(t *testing.T) {
 	// marshal error
 	buff.Reset()
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
+	err = abi.UnpackIntoInterface(&Bytes, "bytes", buff.Bytes())
 	if err == nil {
 		t.Error("expected error")
 	}
 
-	err = abi.Unpack(&Bytes, "multi", make([]byte, 64))
+	err = abi.UnpackIntoInterface(&Bytes, "multi", make([]byte, 64))
 	if err == nil {
 		t.Error("expected error")
 	}
@@ -872,7 +739,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000003"))
 	// marshal int array
 	var intArray [3]*big.Int
-	err = abi.Unpack(&intArray, "intArraySingle", buff.Bytes())
+	err = abi.UnpackIntoInterface(&intArray, "intArraySingle", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
@@ -893,7 +760,7 @@ func TestUnmarshal(t *testing.T) {
 	buff.Write(common.Hex2Bytes("0000000000000000000000000100000000000000000000000000000000000000"))
 
 	var outAddr []common.Address
-	err = abi.Unpack(&outAddr, "addressSliceSingle", buff.Bytes())
+	err = abi.UnpackIntoInterface(&outAddr, "addressSliceSingle", buff.Bytes())
 	if err != nil {
 		t.Fatal("didn't expect error:", err)
 	}
@@ -920,7 +787,7 @@ func TestUnmarshal(t *testing.T) {
 		A []common.Address
 		B []common.Address
 	}
-	err = abi.Unpack(&outAddrStruct, "addressSliceDouble", buff.Bytes())
+	err = abi.UnpackIntoInterface(&outAddrStruct, "addressSliceDouble", buff.Bytes())
 	if err != nil {
 		t.Fatal("didn't expect error:", err)
 	}
@@ -948,14 +815,15 @@ func TestUnmarshal(t *testing.T) {
 	buff.Reset()
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000100"))
 
-	err = abi.Unpack(&outAddr, "addressSliceSingle", buff.Bytes())
+	err = abi.UnpackIntoInterface(&outAddr, "addressSliceSingle", buff.Bytes())
 	if err == nil {
 		t.Fatal("expected error:", err)
 	}
 }
 
 func TestUnpackTuple(t *testing.T) {
-	const simpleTuple = `[{"name":"tuple","constant":false,"outputs":[{"type":"tuple","name":"ret","components":[{"type":"int256","name":"a"},{"type":"int256","name":"b"}]}]}]`
+	t.Parallel()
+	const simpleTuple = `[{"name":"tuple","type":"function","outputs":[{"type":"tuple","name":"ret","components":[{"type":"int256","name":"a"},{"type":"int256","name":"b"}]}]}]`
 	abi, err := JSON(strings.NewReader(simpleTuple))
 	if err != nil {
 		t.Fatal(err)
@@ -965,30 +833,30 @@ func TestUnpackTuple(t *testing.T) {
 	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001")) // ret[a] = 1
 	buff.Write(common.Hex2Bytes("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) // ret[b] = -1
 
-	v := struct {
-		Ret struct {
-			A *big.Int
-			B *big.Int
-		}
-	}{Ret: struct {
+	// If the result is single tuple, use struct as return value container directly.
+	type v struct {
 		A *big.Int
 		B *big.Int
-	}{new(big.Int), new(big.Int)}}
+	}
+	type r struct {
+		Result v
+	}
+	var ret0 = new(r)
+	err = abi.UnpackIntoInterface(ret0, "tuple", buff.Bytes())
 
-	err = abi.Unpack(&v, "tuple", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	} else {
-		if v.Ret.A.Cmp(big.NewInt(1)) != 0 {
-			t.Errorf("unexpected value unpacked: want %x, got %x", 1, v.Ret.A)
+		if ret0.Result.A.Cmp(big.NewInt(1)) != 0 {
+			t.Errorf("unexpected value unpacked: want %x, got %x", 1, ret0.Result.A)
 		}
-		if v.Ret.B.Cmp(big.NewInt(-1)) != 0 {
-			t.Errorf("unexpected value unpacked: want %x, got %x", v.Ret.B, -1)
+		if ret0.Result.B.Cmp(big.NewInt(-1)) != 0 {
+			t.Errorf("unexpected value unpacked: want %x, got %x", -1, ret0.Result.B)
 		}
 	}
 
 	// Test nested tuple
-	const nestedTuple = `[{"name":"tuple","constant":false,"outputs":[
+	const nestedTuple = `[{"name":"tuple","type":"function","outputs":[
 		{"type":"tuple","name":"s","components":[{"type":"uint256","name":"a"},{"type":"uint256[]","name":"b"},{"type":"tuple[]","name":"c","components":[{"name":"x", "type":"uint256"},{"name":"y","type":"uint256"}]}]},
 		{"type":"tuple","name":"t","components":[{"name":"x", "type":"uint256"},{"name":"y","type":"uint256"}]},
 		{"type":"uint256","name":"a"}
@@ -1042,21 +910,22 @@ func TestUnpackTuple(t *testing.T) {
 			},
 		},
 		FieldT: T{
-			big.NewInt(0), big.NewInt(1),
+			big.NewInt(0).SetBits([]big.Word{}), big.NewInt(1),
 		},
 		A: big.NewInt(1),
 	}
 
-	err = abi.Unpack(&ret, "tuple", buff.Bytes())
+	err = abi.UnpackIntoInterface(&ret, "tuple", buff.Bytes())
 	if err != nil {
 		t.Error(err)
 	}
-	if reflect.DeepEqual(ret, expected) {
+	if !reflect.DeepEqual(ret, expected) {
 		t.Error("unexpected unpack value")
 	}
 }
 
 func TestOOMMaliciousInput(t *testing.T) {
+	t.Parallel()
 	oomTests := []unpackTest{
 		{
 			def: `[{"type": "uint8[]"}]`,
@@ -1110,18 +979,186 @@ func TestOOMMaliciousInput(t *testing.T) {
 		},
 	}
 	for i, test := range oomTests {
-		def := fmt.Sprintf(`[{ "name" : "method", "outputs": %s}]`, test.def)
+		def := fmt.Sprintf(`[{ "name" : "method", "type": "function", "outputs": %s}]`, test.def)
 		abi, err := JSON(strings.NewReader(def))
 		if err != nil {
 			t.Fatalf("invalid ABI definition %s: %v", def, err)
 		}
 		encb, err := hex.DecodeString(test.enc)
 		if err != nil {
-			t.Fatalf("invalid hex: %s" + test.enc)
+			t.Fatalf("invalid hex: %s", test.enc)
 		}
 		_, err = abi.Methods["method"].Outputs.UnpackValues(encb)
 		if err == nil {
 			t.Fatalf("Expected error on malicious input, test %d", i)
+		}
+	}
+}
+
+func TestPackAndUnpackIncompatibleNumber(t *testing.T) {
+	t.Parallel()
+	var encodeABI Arguments
+	uint256Ty, err := NewType("uint256", "", nil)
+	if err != nil {
+		panic(err)
+	}
+	encodeABI = Arguments{
+		{Type: uint256Ty},
+	}
+
+	maxU64, ok := new(big.Int).SetString(strconv.FormatUint(math.MaxUint64, 10), 10)
+	if !ok {
+		panic("bug")
+	}
+	maxU64Plus1 := new(big.Int).Add(maxU64, big.NewInt(1))
+	cases := []struct {
+		decodeType  string
+		inputValue  *big.Int
+		unpackErr   error
+		packErr     error
+		expectValue interface{}
+	}{
+		{
+			decodeType: "uint8",
+			inputValue: big.NewInt(math.MaxUint8 + 1),
+			unpackErr:  errBadUint8,
+		},
+		{
+			decodeType:  "uint8",
+			inputValue:  big.NewInt(math.MaxUint8),
+			unpackErr:   nil,
+			expectValue: uint8(math.MaxUint8),
+		},
+		{
+			decodeType: "uint16",
+			inputValue: big.NewInt(math.MaxUint16 + 1),
+			unpackErr:  errBadUint16,
+		},
+		{
+			decodeType:  "uint16",
+			inputValue:  big.NewInt(math.MaxUint16),
+			unpackErr:   nil,
+			expectValue: uint16(math.MaxUint16),
+		},
+		{
+			decodeType: "uint32",
+			inputValue: big.NewInt(math.MaxUint32 + 1),
+			unpackErr:  errBadUint32,
+		},
+		{
+			decodeType:  "uint32",
+			inputValue:  big.NewInt(math.MaxUint32),
+			unpackErr:   nil,
+			expectValue: uint32(math.MaxUint32),
+		},
+		{
+			decodeType: "uint64",
+			inputValue: maxU64Plus1,
+			unpackErr:  errBadUint64,
+		},
+		{
+			decodeType:  "uint64",
+			inputValue:  maxU64,
+			unpackErr:   nil,
+			expectValue: uint64(math.MaxUint64),
+		},
+		{
+			decodeType:  "uint256",
+			inputValue:  maxU64Plus1,
+			unpackErr:   nil,
+			expectValue: maxU64Plus1,
+		},
+		{
+			decodeType: "int8",
+			inputValue: big.NewInt(math.MaxInt8 + 1),
+			unpackErr:  errBadInt8,
+		},
+		{
+			inputValue: big.NewInt(math.MinInt8 - 1),
+			packErr:    errInvalidSign,
+		},
+		{
+			decodeType:  "int8",
+			inputValue:  big.NewInt(math.MaxInt8),
+			unpackErr:   nil,
+			expectValue: int8(math.MaxInt8),
+		},
+		{
+			decodeType: "int16",
+			inputValue: big.NewInt(math.MaxInt16 + 1),
+			unpackErr:  errBadInt16,
+		},
+		{
+			inputValue: big.NewInt(math.MinInt16 - 1),
+			packErr:    errInvalidSign,
+		},
+		{
+			decodeType:  "int16",
+			inputValue:  big.NewInt(math.MaxInt16),
+			unpackErr:   nil,
+			expectValue: int16(math.MaxInt16),
+		},
+		{
+			decodeType: "int32",
+			inputValue: big.NewInt(math.MaxInt32 + 1),
+			unpackErr:  errBadInt32,
+		},
+		{
+			inputValue: big.NewInt(math.MinInt32 - 1),
+			packErr:    errInvalidSign,
+		},
+		{
+			decodeType:  "int32",
+			inputValue:  big.NewInt(math.MaxInt32),
+			unpackErr:   nil,
+			expectValue: int32(math.MaxInt32),
+		},
+		{
+			decodeType: "int64",
+			inputValue: new(big.Int).Add(big.NewInt(math.MaxInt64), big.NewInt(1)),
+			unpackErr:  errBadInt64,
+		},
+		{
+			inputValue: new(big.Int).Sub(big.NewInt(math.MinInt64), big.NewInt(1)),
+			packErr:    errInvalidSign,
+		},
+		{
+			decodeType:  "int64",
+			inputValue:  big.NewInt(math.MaxInt64),
+			unpackErr:   nil,
+			expectValue: int64(math.MaxInt64),
+		},
+	}
+	for i, testCase := range cases {
+		packed, err := encodeABI.Pack(testCase.inputValue)
+		if testCase.packErr != nil {
+			if err == nil {
+				t.Fatalf("expected packing of testcase input value to fail")
+			}
+			if err != testCase.packErr {
+				t.Fatalf("expected error '%v', got '%v'", testCase.packErr, err)
+			}
+			continue
+		}
+		if err != nil && err != testCase.packErr {
+			panic(fmt.Errorf("unexpected error packing test-case input: %v", err))
+		}
+		ty, err := NewType(testCase.decodeType, "", nil)
+		if err != nil {
+			panic(err)
+		}
+		decodeABI := Arguments{
+			{Type: ty},
+		}
+		decoded, err := decodeABI.Unpack(packed)
+		if err != testCase.unpackErr {
+			t.Fatalf("Expected error %v, actual error %v. case %d", testCase.unpackErr, err, i)
+		}
+		if err != nil {
+			continue
+		}
+		if !reflect.DeepEqual(decoded[0], testCase.expectValue) {
+			t.Fatalf("Expected value %v, actual value %v", testCase.expectValue, decoded[0])
 		}
 	}
 }

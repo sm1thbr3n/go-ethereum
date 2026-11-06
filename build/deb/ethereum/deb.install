@@ -1,1 +1,5 @@
 build/bin/{{.BinaryName}} usr/bin
+{{- if eq .BinaryName "geth" }}
+build/completions/bash/geth etc/bash_completion.d
+build/completions/zsh/_geth usr/share/zsh/vendor-completions
+{{end -}}

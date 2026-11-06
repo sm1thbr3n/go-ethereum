@@ -17,19 +17,19 @@
 package build
 
 import (
+	"bufio"
 	"bytes"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 )
 
 var DryRunFlag = flag.Bool("n", false, "dry run, don't execute commands")
@@ -37,27 +37,72 @@ var DryRunFlag = flag.Bool("n", false, "dry run, don't execute commands")
 // MustRun executes the given command and exits the host process for
 // any error.
 func MustRun(cmd *exec.Cmd) {
-	fmt.Println(">>>", strings.Join(cmd.Args, " "))
-	if !*DryRunFlag {
-		cmd.Stderr = os.Stderr
-		cmd.Stdout = os.Stdout
-		if err := cmd.Run(); err != nil {
-			log.Fatal(err)
-		}
+	if err := Run(cmd); err != nil {
+		log.Fatal(err)
 	}
+}
+
+// Run executes the command, echoing it first and streaming its output, and
+// returns any failure rather than terminating the process. Use it where a
+// failure should be collected and reported alongside the work that did
+// succeed; use MustRun where there is nothing sensible to continue with.
+func Run(cmd *exec.Cmd) error {
+	if cmd.Dir != "" && cmd.Dir != "." {
+		fmt.Printf("(in %s) ", cmd.Dir)
+	}
+	fmt.Println(">>>", printArgs(cmd.Args))
+	if *DryRunFlag {
+		return nil
+	}
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	return cmd.Run()
+}
+
+func printArgs(args []string) string {
+	var s strings.Builder
+	for i, arg := range args {
+		if i > 0 {
+			s.WriteByte(' ')
+		}
+		if strings.IndexByte(arg, ' ') >= 0 {
+			arg = strconv.QuoteToASCII(arg)
+		}
+		s.WriteString(arg)
+	}
+	return s.String()
 }
 
 func MustRunCommand(cmd string, args ...string) {
 	MustRun(exec.Command(cmd, args...))
 }
 
-// GOPATH returns the value that the GOPATH environment
-// variable should be set to.
-func GOPATH() string {
-	if os.Getenv("GOPATH") == "" {
-		log.Fatal("GOPATH is not set")
-	}
-	return os.Getenv("GOPATH")
+// MustRunCommandWithOutput runs the given command, and ensures that some output will be
+// printed while it runs. This is useful for CI builds where the process will be stopped
+// when there is no output.
+func MustRunCommandWithOutput(cmd string, args ...string) {
+	MustRunWithOutput(exec.Command(cmd, args...))
+}
+
+// MustRunWithOutput runs the given command, and ensures that some output will be printed
+// while it runs. This is useful for CI builds where the process will be stopped when
+// there is no output.
+func MustRunWithOutput(cmd *exec.Cmd) {
+	interval := time.NewTicker(time.Minute)
+	done := make(chan struct{})
+	defer interval.Stop()
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-interval.C:
+				fmt.Printf("Waiting for command %q\n", cmd)
+			case <-done:
+				return
+			}
+		}
+	}()
+	MustRun(cmd)
 }
 
 var warnedAboutGit bool
@@ -68,21 +113,32 @@ func RunGit(args ...string) string {
 	cmd := exec.Command("git", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err == exec.ErrNotFound {
-		if !warnedAboutGit {
-			log.Println("Warning: can't find 'git' in PATH")
-			warnedAboutGit = true
+	if err := cmd.Run(); err != nil {
+		if e, ok := err.(*exec.Error); ok && e.Err == exec.ErrNotFound {
+			if !warnedAboutGit {
+				log.Println("Warning: can't find 'git' in PATH")
+				warnedAboutGit = true
+			}
+			return ""
 		}
-		return ""
-	} else if err != nil {
 		log.Fatal(strings.Join(cmd.Args, " "), ": ", err, "\n", stderr.String())
 	}
 	return strings.TrimSpace(stdout.String())
 }
 
+// gitOutput runs a git subcommand and returns its output, or "" if git can't be
+// run or the command fails.
+func gitOutput(args ...string) string {
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // readGitFile returns content of file in .git directory.
 func readGitFile(file string) string {
-	content, err := ioutil.ReadFile(path.Join(".git", file))
+	content, err := os.ReadFile(filepath.Join(".git", file))
 	if err != nil {
 		return ""
 	}
@@ -117,79 +173,17 @@ func render(tpl *template.Template, outputFile string, outputPerm os.FileMode, x
 	}
 }
 
-// CopyFile copies a file.
-func CopyFile(dst, src string, mode os.FileMode) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		log.Fatal(err)
-	}
-	destFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer destFile.Close()
-
-	srcFile, err := os.Open(src)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer srcFile.Close()
-
-	if _, err := io.Copy(destFile, srcFile); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// GoTool returns the command that runs a go tool. This uses go from GOROOT instead of PATH
-// so that go commands executed by build use the same version of Go as the 'host' that runs
-// build code. e.g.
-//
-//     /usr/lib/go-1.12.1/bin/go run build/ci.go ...
-//
-// runs using go 1.12.1 and invokes go 1.12.1 tools from the same GOROOT. This is also important
-// because runtime.Version checks on the host should match the tools that are run.
-func GoTool(tool string, args ...string) *exec.Cmd {
-	args = append([]string{tool}, args...)
-	return exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"), args...)
-}
-
-// ExpandPackagesNoVendor expands a cmd/go import path pattern, skipping
-// vendored packages.
-func ExpandPackagesNoVendor(patterns []string) []string {
-	expand := false
-	for _, pkg := range patterns {
-		if strings.Contains(pkg, "...") {
-			expand = true
-		}
-	}
-	if expand {
-		cmd := GoTool("list", patterns...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Fatalf("package listing failed: %v\n%s", err, string(out))
-		}
-		var packages []string
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, "/vendor/") {
-				packages = append(packages, strings.TrimSpace(line))
-			}
-		}
-		return packages
-	}
-	return patterns
-}
-
 // UploadSFTP uploads files to a remote host using the sftp command line tool.
-// The destination host may be specified either as [user@]host[: or as a URI in
+// The destination host may be specified either as [user@]host: or as a URI in
 // the form sftp://[user@]host[:port].
 func UploadSFTP(identityFile, host, dir string, files []string) error {
 	sftp := exec.Command("sftp")
-	sftp.Stdout = nil
 	sftp.Stderr = os.Stderr
 	if identityFile != "" {
 		sftp.Args = append(sftp.Args, "-i", identityFile)
 	}
 	sftp.Args = append(sftp.Args, host)
-	fmt.Println(">>>", strings.Join(sftp.Args, " "))
+	fmt.Println(">>>", printArgs(sftp.Args))
 	if *DryRunFlag {
 		return nil
 	}
@@ -198,13 +192,62 @@ func UploadSFTP(identityFile, host, dir string, files []string) error {
 	if err != nil {
 		return fmt.Errorf("can't create stdin pipe for sftp: %v", err)
 	}
+	stdout, err := sftp.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("can't create stdout pipe for sftp: %v", err)
+	}
 	if err := sftp.Start(); err != nil {
 		return err
 	}
 	in := io.MultiWriter(stdin, os.Stdout)
 	for _, f := range files {
-		fmt.Fprintln(in, "put", f, path.Join(dir, filepath.Base(f)))
+		fmt.Fprintln(in, "put", f, filepath.Join(dir, filepath.Base(f)))
 	}
+	fmt.Fprintln(in, "exit")
+	// Some issue with the PPA sftp server makes it so the server does not
+	// respond properly to a 'bye', 'exit' or 'quit' from the client.
+	// To work around that, we check the output, and when we see the client
+	// exit command, we do a hard exit.
+	// See
+	// https://github.com/kolban-google/sftp-gcs/issues/23
+	// https://github.com/mscdex/ssh2/pull/1111
+	aborted := false
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			txt := scanner.Text()
+			fmt.Println(txt)
+			if txt == "sftp> exit" {
+				// Give it .5 seconds to exit (server might be fixed), then
+				// hard kill it from the outside
+				time.Sleep(500 * time.Millisecond)
+				aborted = true
+				sftp.Process.Kill()
+			}
+		}
+	}()
 	stdin.Close()
-	return sftp.Wait()
+	err = sftp.Wait()
+	if aborted {
+		return nil
+	}
+	return err
+}
+
+// FindMainPackages finds all 'main' packages in the given directory and returns their
+// package paths.
+func FindMainPackages(tc *GoToolchain, pattern string) []string {
+	list := tc.Go("list", "-f", `{{if eq .Name "main"}}{{.ImportPath}}{{end}}`, pattern)
+	output, err := list.Output()
+	if err != nil {
+		log.Fatal("go list failed:", err)
+	}
+	var result []string
+	for l := range bytes.Lines(output) {
+		l = bytes.TrimSpace(l)
+		if len(l) > 0 {
+			result = append(result, string(l))
+		}
+	}
+	return result
 }

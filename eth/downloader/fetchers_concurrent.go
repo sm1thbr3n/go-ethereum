@@ -1,0 +1,443 @@
+// Copyright 2021 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package downloader
+
+import (
+	"errors"
+	"sort"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/prque"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/log"
+)
+
+// timeoutGracePeriod is the amount of time to allow for a peer to deliver a
+// response to a locally already timed out request. Timeouts are not penalized
+// as a peer might be temporarily overloaded, however, they still must reply
+// to each request. Failing to do so is considered a protocol violation.
+var timeoutGracePeriod = 2 * time.Minute
+
+// headStallFactor is the multiplier applied to the target round trip time to
+// obtain the threshold beyond which a request holding the head of the result
+// cache is considered lagging and is expired early, so that an idle peer can
+// retrieve the items instead.
+const headStallFactor = 2
+
+// headStallCheckInterval is the frequency at which the request holding the
+// head of the result cache is checked for lagging.
+const headStallCheckInterval = 200 * time.Millisecond
+
+// typedQueue is an interface defining the adaptor needed to translate the type
+// specific downloader/queue schedulers into the type-agnostic general concurrent
+// fetcher algorithm calls.
+type typedQueue interface {
+	// waker returns a notification channel that gets pinged in case more fetches
+	// have been queued up, so the fetcher might assign it to idle peers.
+	waker() chan bool
+
+	// pending returns the number of wrapped items that are currently queued for
+	// fetching by the concurrent downloader.
+	pending() int
+
+	// next returns the number of the block at the head of the queue, which is
+	// the first one to be handed out, and false if the queue is empty.
+	next() (uint64, bool)
+
+	// capacity is responsible for calculating how many items of the abstracted
+	// type a particular peer is estimated to be able to retrieve within the
+	// allotted round trip time.
+	capacity(peer *peerConnection, rtt time.Duration) int
+
+	// updateCapacity is responsible for updating how many items of the abstracted
+	// type a particular peer is estimated to be able to retrieve in a unit time.
+	updateCapacity(peer *peerConnection, items int, elapsed time.Duration)
+
+	// reserve is responsible for allocating a requested number of pending items
+	// from the download queue to the specified peer.
+	reserve(peer *peerConnection, items int) (*fetchRequest, bool, bool)
+
+	// requeue is responsible for placing the current retrieval allocation of a
+	// specific peer back into the pool for some other peer to retrieve as well.
+	// The allocation itself is kept, so a late delivery is still accepted; it
+	// is dropped along with the peer when that disconnects.
+	requeue(peer string)
+
+	// request is responsible for converting a generic fetch request into a typed
+	// one and sending it to the remote peer for fulfillment.
+	request(peer *peerConnection, req *fetchRequest, resCh chan *eth.Response) (*eth.Request, error)
+
+	// deliver is responsible for taking a generic response packet from the
+	// concurrent fetcher, unpacking the type specific data and delivering
+	// it to the downloader's queue. It returns the number of items that
+	// validated, whether or not they were still needed on arrival.
+	deliver(peer *peerConnection, packet *eth.Response) (int, error)
+
+	// stalled returns the peer whose request holds the head of the result cache
+	// and has been outstanding for longer than the given threshold, blocking
+	// the consumer. An empty string is returned if nothing is blocked.
+	stalled(threshold time.Duration) string
+
+	// metrics returns the collectors the concurrent fetcher reports the
+	// scheduling state of this data type into.
+	metrics() *fetchMetrics
+}
+
+// concurrentFetch iteratively downloads scheduled block parts, taking available
+// peers, reserving a chunk of fetch requests for each and waiting for delivery
+// or timeouts.
+func (d *Downloader) concurrentFetch(queue typedQueue) error {
+	// Create a delivery channel to accept responses from all peers
+	responses := make(chan *eth.Response)
+
+	// Track the currently active requests and their timeout order
+	pending := make(map[string]*eth.Request)
+	defer func() {
+		// Abort all requests on sync cycle cancellation. The requests may still
+		// be fulfilled by the remote side, but the dispatcher will not wait to
+		// deliver them since nobody's going to be listening.
+		for _, req := range pending {
+			req.Close()
+		}
+	}()
+	ordering := make(map[*eth.Request]int)
+	timeouts := prque.New[int64, *eth.Request](func(data *eth.Request, index int) {
+		ordering[data] = index
+	})
+
+	timeout := time.NewTimer(0)
+	if !timeout.Stop() {
+		<-timeout.C
+	}
+	defer timeout.Stop()
+
+	// untrack removes a request from the timeout heap, rescheduling the timer
+	// if the request was the next one to expire.
+	untrack := func(req *eth.Request) {
+		index, live := ordering[req]
+		if !live {
+			return
+		}
+		timeouts.Remove(index)
+		if index == 0 {
+			if !timeout.Stop() {
+				<-timeout.C
+			}
+			if timeouts.Size() > 0 {
+				_, exp := timeouts.Peek()
+				timeout.Reset(time.Until(time.Unix(0, -exp)))
+			}
+		}
+		delete(ordering, req)
+	}
+	// Periodically check whether the request holding the head of the result
+	// cache is lagging behind the rest of the peers
+	headStall := time.NewTicker(headStallCheckInterval)
+	defer headStall.Stop()
+
+	// Track the timed-out but not-yet-answered requests separately. We want to
+	// keep tracking which peers are busy (potentially overloaded), so removing
+	// all trace of a timed out request is not good. We also can't just cancel
+	// the pending request altogether as that would prevent a late response from
+	// being delivered, thus never unblocking the peer.
+	stales := make(map[string]*eth.Request)
+
+	defer func() {
+		// Abort all requests on sync cycle cancellation. The requests may still
+		// be fulfilled by the remote side, but the dispatcher will not wait to
+		// deliver them since nobody's going to be listening.
+		for _, req := range stales {
+			req.Close()
+		}
+	}()
+	// Subscribe to peer lifecycle events to schedule tasks to new joiners and
+	// reschedule tasks upon disconnections. We don't care which event happened
+	// for simplicity, so just use a single channel.
+	peering := make(chan *peeringEvent, 64) // arbitrary buffer, just some burst protection
+
+	peeringSub := d.peers.SubscribeEvents(peering)
+	defer peeringSub.Unsubscribe()
+
+	// Prepare the queue and fetch block parts until the block header fetcher's done
+	finished := false
+	for {
+		// If there's nothing more to fetch, wait or terminate
+		if queue.pending() == 0 {
+			if len(pending) == 0 && finished {
+				return nil
+			}
+		} else {
+			// Send a download request to all idle peers, until throttled
+			var (
+				idles    []*peerConnection
+				caps     []int
+				capacity int // Estimated aggregate items/s across all peers
+				ranged   int // Peers whose announced block range excludes the next block
+			)
+			next, queued := queue.next()
+			for _, peer := range d.peers.AllPeers() {
+				pending, stale := pending[peer.id], stales[peer.id]
+				items := queue.capacity(peer, time.Second)
+
+				if pending == nil && stale == nil {
+					// Peers announce the block range they serve bodies and
+					// receipts for. Requests are handed out from the queue
+					// head, so a peer whose range excludes it has nothing to
+					// contribute until the head catches up with its range.
+					if queued && !peer.serves(next) {
+						ranged++
+						continue
+					}
+					idles = append(idles, peer)
+					caps = append(caps, items)
+				}
+				capacity += items
+
+				if stale != nil {
+					if waited := time.Since(stale.Sent); waited > timeoutGracePeriod {
+						// Request has been in flight longer than the grace period
+						// permitted it, consider the peer malicious attempting to
+						// stall the sync.
+						peer.log.Warn("Peer stalling, dropping", "waited", common.PrettyDuration(waited))
+						d.dropPeer(peer.id)
+					}
+				}
+			}
+			sort.Sort(&peerCapacitySort{idles, caps})
+
+			var (
+				stats     = queue.metrics()
+				targetRTT = d.peers.rates.TargetRoundTrip()
+				assigned  int
+				throttled bool
+			)
+			rttTargetGauge.Update(targetRTT.Milliseconds())
+
+			for _, peer := range idles {
+				// Short circuit if throttling activated or there are no more
+				// queued tasks to be retrieved
+				if throttled {
+					break
+				}
+				if queued := queue.pending(); queued == 0 {
+					stats.starved.Mark(1)
+					break
+				}
+				// Reserve a chunk of fetches for a peer. A nil can mean either that
+				// no more headers are available, or that the peer is known not to
+				// have them.
+				request, _, throttle := queue.reserve(peer, queue.capacity(peer, targetRTT))
+				if throttle {
+					throttled = true
+					stats.throttled.Mark(1)
+				}
+				if request == nil {
+					continue
+				}
+				// Fetch the chunk and make sure any errors return the hashes to the queue
+				req, err := queue.request(peer, request, responses)
+				if err != nil {
+					// Sending the request failed, which generally means the peer
+					// was disconnected in between assignment and network send.
+					// Although all peer removal operations return allocated tasks
+					// to the queue, that is async, and we can do better here by
+					// immediately pushing the unfulfilled requests. Drop the peer
+					// too: the reservation is only released by its removal, and
+					// a send that fails for any other reason than the connection
+					// going away is not worth keeping the peer around for.
+					queue.requeue(peer.id)
+					d.dropPeer(peer.id)
+					continue
+				}
+				pending[peer.id] = req
+				assigned++
+
+				ttl := d.peers.rates.TargetTimeout()
+				ordering[req] = timeouts.Size()
+
+				timeouts.Push(req, -time.Now().Add(ttl).UnixNano())
+				if timeouts.Size() == 1 {
+					timeout.Reset(ttl)
+				}
+			}
+			stats.idlePeers.Update(int64(len(idles) - assigned))
+			stats.busyPeers.Update(int64(len(pending)))
+			stats.stalePeers.Update(int64(len(stales)))
+			stats.rangedPeers.Update(int64(ranged))
+			stats.capacity.Update(int64(capacity))
+		}
+		// Wait for something to happen
+		select {
+		case <-d.cancelCh:
+			// If sync was cancelled, tear down the parallel retriever. Pending
+			// requests will be cancelled locally, and the remote responses will
+			// be dropped when they arrive
+			return errCanceled
+
+		case event := <-peering:
+			// A peer joined or left, the tasks queue and allocations need to be
+			// checked for potential assignment or reassignment
+			peerid := event.peer.id
+
+			if event.join {
+				// Sanity check the internal state; this can be dropped later
+				if _, ok := pending[peerid]; ok {
+					event.peer.log.Error("Pending request exists for joining peer")
+				}
+				if _, ok := stales[peerid]; ok {
+					event.peer.log.Error("Stale request exists for joining peer")
+				}
+				// Loop back to the entry point for task assignment
+				continue
+			}
+			// A peer left, any existing requests need to be untracked, pending
+			// tasks returned and possible reassignment checked
+			if req, ok := pending[peerid]; ok {
+				queue.requeue(peerid)
+				delete(pending, peerid)
+				req.Close()
+				untrack(req)
+			}
+			if req, ok := stales[peerid]; ok {
+				delete(stales, peerid)
+				req.Close()
+			}
+
+		case <-timeout.C:
+			// Retrieve the next request which should have timed out. The check
+			// below is purely for to catch programming errors, given the correct
+			// code, there's no possible order of events that should result in a
+			// timeout firing for a non-existent event.
+			req, exp := timeouts.Peek()
+			if now, at := time.Now(), time.Unix(0, -exp); now.Before(at) {
+				log.Error("Timeout triggered but not reached", "left", at.Sub(now))
+				timeout.Reset(at.Sub(now))
+				continue
+			}
+			// Stop tracking the timed out request from a timing perspective,
+			// cancel it, so it's not considered in-flight anymore, but keep
+			// the peer marked busy to prevent assigning a second request and
+			// overloading it further.
+			delete(pending, req.Peer)
+			stales[req.Peer] = req
+
+			timeouts.Pop() // Popping an item will reorder indices in `ordering`, delete after, otherwise will resurrect!
+			if timeouts.Size() > 0 {
+				_, exp := timeouts.Peek()
+				timeout.Reset(time.Until(time.Unix(0, -exp)))
+			}
+			delete(ordering, req)
+
+			// Timing out is not a protocol violation in itself: the timeout is
+			// derived from the round trip of the peer set as a whole, so a peer
+			// merely slower than the rest runs into it while still making
+			// progress. Re-schedule the task to other peers and the peer will
+			// enter the "staleness" management. If the response can be delivered,
+			// the capacity will be updated accordingly; otherwise the peer will
+			// be dropped after timeoutGracePeriod.
+			queue.requeue(req.Peer)
+
+		case <-headStall.C:
+			// If the consumer is blocked on a request that has been outstanding
+			// for a lot longer than what the other peers need, hand its items to
+			// an idle peer as well, keeping the original reservation: whichever
+			// reply arrives first fills the result cache, the other is dropped
+			// as stale. The lagging peer is not assigned anything else until it
+			// answers, but not penalized otherwise.
+			id := queue.stalled(headStallFactor * d.peers.rates.TargetRoundTrip())
+			if id == "" {
+				continue
+			}
+			req, ok := pending[id]
+			if !ok {
+				continue
+			}
+			untrack(req)
+			delete(pending, id)
+			stales[id] = req
+
+			queue.requeue(id)
+			queue.metrics().headExpiries.Mark(1)
+
+			if peer := d.peers.Peer(id); peer != nil {
+				peer.log.Debug("Requeued request blocking the result cache head", "waited", common.PrettyDuration(time.Since(req.Sent)))
+			}
+
+		case res := <-responses:
+			// Response arrived, it may be for an existing or an already timed
+			// out request. If the former, update the timeout heap and perhaps
+			// reschedule the timeout timer.
+			untrack(res.Req)
+
+			// Delete the pending request (if it still exists) and mark the peer idle
+			delete(pending, res.Req.Peer)
+			delete(stales, res.Req.Peer)
+
+			// If the peer was previously banned and failed to deliver its pack
+			// in a reasonable time frame, ignore its message.
+			peer := d.peers.Peer(res.Req.Peer)
+			if peer == nil {
+				res.Done <- nil
+				res.Req.Close()
+				continue
+			}
+			// Deliver the received chunk of data and check chain validity
+			delivered, err := queue.deliver(peer, res)
+
+			// Measure the peer on what it served, whether or not the items were
+			// still needed: a reply outliving its request arrives after they
+			// were requeued and likely fetched elsewhere, but the rate it was
+			// served at is just as real, and a slow one is what sizes down the
+			// requests the peer is handed next.
+			items, elapsed := delivered, res.Time
+			if res.Roundtrips > 1 && items > 0 {
+				// Partial receipt response can be assembled over multiple round trips.
+				// Scale both values down to a single round trip.
+				items = max(1, items/res.Roundtrips)
+				elapsed = res.Time * time.Duration(items) / time.Duration(delivered)
+			}
+			queue.updateCapacity(peer, items, elapsed)
+
+			res.Done <- validityErrorOfRequest(err)
+			res.Req.Close()
+
+			if errors.Is(err, errInvalidChain) {
+				// errInvalidChain is the signal that processing of items failed internally,
+				// even though the items were validly encoded.
+				//
+				// This can be due to invalid blocks, or a database error.
+				// The sync cycle should be aborted for such errors, so we return it here.
+				return err
+			}
+
+		case cont := <-queue.waker():
+			// The header fetcher sent a continuation flag, check if it's done
+			if !cont {
+				finished = true
+			}
+		}
+	}
+}
+
+// validityErrorOfRequest returns err if it is related to block validity, and nil otherwise.
+func validityErrorOfRequest(err error) error {
+	if errors.Is(err, errInvalidBody) || errors.Is(err, errInvalidReceipt) || errors.Is(err, errInvalidBAL) {
+		return err
+	}
+	return nil
+}

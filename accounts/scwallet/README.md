@@ -8,7 +8,7 @@
 
 ## Preparing the smartcard
 
-  **WARNING: FOILLOWING THESE INSTRUCTIONS WILL DESTROY THE MASTER KEY ON YOUR CARD. ONLY PROCEED IF NO FUNDS ARE ASSOCIATED WITH THESE ACCOUNTS**
+  **WARNING: FOLLOWING THESE INSTRUCTIONS WILL DESTROY THE MASTER KEY ON YOUR CARD. ONLY PROCEED IF NO FUNDS ARE ASSOCIATED WITH THESE ACCOUNTS**
 
   You can use status' [keycard-cli](https://github.com/status-im/keycard-cli) and you should get _at least_ version 2.1.1 of their [smartcard application](https://github.com/status-im/status-keycard/releases/download/2.2.1/keycard_v2.2.1.cap)
 
@@ -25,29 +25,33 @@
   Start `geth` with the `console` command. You will notice the following warning:
 
   ```
-  WARN [04-09|16:58:38.898] Failed to open wallet                    url=pcsc://044def09                          err="smartcard: pairing password needed"
+  WARN [04-09|16:58:38.898] Failed to open wallet                    url=keycard://044def09                          err="smartcard: pairing password needed"
   ```
 
-  Write down the URL (`pcsc://044def09` in this example). Then ask `geth` to open the wallet:
+  Write down the URL (`keycard://044def09` in this example). Then ask `geth` to open the wallet:
 
   ```
-  > personal.openWallet("pcsc://044def09")
-  Please enter the pairing password:
+  > personal.openWallet("keycard://044def09", "pairing password")
   ```
 
-  Enter the pairing password that you have received during card initialization. Same with the PIN that you will subsequently be
-  asked for.
+  The pairing password has been generated during the card initialization process.
+  
+  The process needs to be repeated once more with the PIN:
+
+  ```
+  > personal.openWallet("keycard://044def09", "PIN number")
+  ```
   
   If everything goes well, you should see your new account when typing `personal` on the console:
 
   ```
   > personal
-  WARN [04-09|17:02:07.330] Smartcard wallet account derivation failed url=pcsc://044def09 err="Unexpected response status Cla=0x80, Ins=0xd1, Sw=0x6985"
+  WARN [04-09|17:02:07.330] Smartcard wallet account derivation failed url=keycard://044def09 err="Unexpected response status Cla=0x80, Ins=0xd1, Sw=0x6985"
   {
     listAccounts: [],
     listWallets: [{
         status: "Empty, waiting for initialization",
-        url: "pcsc://044def09"
+        url: "keycard://044def09"
     }],
     ...
   }
@@ -56,7 +60,7 @@
   So the communication with the card is working, but there is no key associated with this wallet. Let's create it:
 
   ```
-  > personal.initializeWallet("pcsc://044def09")
+  > personal.initializeWallet("keycard://044def09")
   "tilt ... impact"
   ```
 
@@ -67,10 +71,10 @@
   [{
     accounts: [{
         address: "0x678b7cd55c61917defb23546a41803c5bfefbc7a",
-        url: "pcsc://044d/m/44'/60'/0'/0/0"
+        url: "keycard://044d/m/44'/60'/0'/0/0"
     }],
     status: "Online",
-    url: "pcsc://044def09"
+    url: "keycard://044def09"
   }]
   ```
 
@@ -84,14 +88,14 @@
 ```
   listWallets: [{
       status: "Online, can derive public keys",
-      url: "pcsc://a4d73015"
+      url: "keycard://a4d73015"
   }]
 ```
 
   3. Open the wallet, you will be prompted for your pairing password, then PIN:
 
 ```
-personal.openWallet("pcsc://a4d73015")
+personal.openWallet("keycard://a4d73015")
 ```
 
   4. Check that creation was successful by typing e.g. `personal`. Then use it like a regular wallet.

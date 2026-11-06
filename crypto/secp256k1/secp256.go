@@ -2,20 +2,24 @@
 // Use of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
+//go:build !gofuzz && cgo
+// +build !gofuzz,cgo
+
 // Package secp256k1 wraps the bitcoin secp256k1 C library.
 package secp256k1
 
 /*
 #cgo CFLAGS: -I./libsecp256k1
 #cgo CFLAGS: -I./libsecp256k1/src/
-#define USE_NUM_NONE
-#define USE_FIELD_10X26
-#define USE_FIELD_INV_BUILTIN
-#define USE_SCALAR_8X32
-#define USE_SCALAR_INV_BUILTIN
-#define NDEBUG
+
+#ifndef NDEBUG
+#  define NDEBUG
+#endif
+
 #include "./libsecp256k1/src/secp256k1.c"
 #include "./libsecp256k1/src/modules/recovery/main_impl.h"
+#include "./libsecp256k1/src/precomputed_ecmult.c"
+#include "./libsecp256k1/src/precomputed_ecmult_gen.c"
 #include "ext.h"
 
 typedef void (*callbackFunc) (const char* msg, void* data);

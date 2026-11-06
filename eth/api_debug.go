@@ -1,0 +1,548 @@
+// Copyright 2023 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package eth
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/stateless"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/trie"
+)
+
+// DebugAPI is the collection of Ethereum full node APIs for debugging the
+// protocol.
+type DebugAPI struct {
+	eth *Ethereum
+}
+
+// NewDebugAPI creates a new DebugAPI instance.
+func NewDebugAPI(eth *Ethereum) *DebugAPI {
+	return &DebugAPI{eth: eth}
+}
+
+// DumpBlock retrieves the entire state of the database at a given block.
+func (api *DebugAPI) DumpBlock(blockNr rpc.BlockNumber) (state.Dump, error) {
+	opts := &state.DumpConfig{
+		OnlyWithAddresses: true,
+		Max:               AccountRangeMaxResults, // Sanity limit over RPC
+	}
+	if blockNr == rpc.PendingBlockNumber {
+		// If we're dumping the pending state, we need to request
+		// both the pending block as well as the pending state from
+		// the miner and operate on those
+		_, _, stateDb := api.eth.miner.Pending()
+		if stateDb == nil {
+			return state.Dump{}, errors.New("pending state is not available")
+		}
+		return stateDb.RawDump(opts), nil
+	}
+	var header *types.Header
+	switch blockNr {
+	case rpc.LatestBlockNumber:
+		header = api.eth.blockchain.CurrentBlock()
+	case rpc.FinalizedBlockNumber:
+		header = api.eth.blockchain.CurrentFinalBlock()
+	case rpc.SafeBlockNumber:
+		header = api.eth.blockchain.CurrentSafeBlock()
+	default:
+		block := api.eth.blockchain.GetBlockByNumber(uint64(blockNr))
+		if block == nil {
+			return state.Dump{}, fmt.Errorf("block #%d not found", blockNr)
+		}
+		header = block.Header()
+	}
+	if header == nil {
+		return state.Dump{}, fmt.Errorf("block #%d not found", blockNr)
+	}
+	stateDb, err := api.eth.BlockChain().StateAt(header.Root, header.Number, header.Time)
+	if err != nil {
+		return state.Dump{}, err
+	}
+	return stateDb.RawDump(opts), nil
+}
+
+// Preimage is a debug API function that returns the preimage for a sha3 hash, if known.
+func (api *DebugAPI) Preimage(ctx context.Context, hash common.Hash) (hexutil.Bytes, error) {
+	if preimage := rawdb.ReadPreimage(api.eth.ChainDb(), hash); preimage != nil {
+		return preimage, nil
+	}
+	return nil, errors.New("unknown preimage")
+}
+
+// BadBlockArgs represents the entries in the list returned when bad blocks are queried.
+type BadBlockArgs struct {
+	Hash  common.Hash            `json:"hash"`
+	Block map[string]interface{} `json:"block"`
+	RLP   string                 `json:"rlp"`
+
+	// Detail is the RLP-encoded execution detail recorded for blocks that were
+	// built locally and then failed to re-import: the build-time receipts,
+	// tried-and-reverted transactions and the failure reason. It is empty for
+	// ordinary bad blocks reported by peers.
+	//
+	// It is carried as opaque RLP rather than expanded into JSON so that it
+	// round-trips exactly, which is what lets a bad block be moved to another
+	// node and replayed there with debug_replayBadBlock.
+	Detail string `json:"detail,omitempty"`
+}
+
+// GetBadBlocks returns a list of the last 'bad blocks' that the client has
+// seen on the network and returns them as a JSON list of block hashes.
+//
+// If file is given, the bad block list will be written into the file instead.
+func (api *DebugAPI) GetBadBlocks(ctx context.Context, file *string) ([]*BadBlockArgs, error) {
+	var (
+		blocks, details = rawdb.ReadAllBadBlocksWithDetails(api.eth.chainDb)
+		results         = make([]*BadBlockArgs, 0, len(blocks))
+	)
+	for i, block := range blocks {
+		var (
+			blockRlp  string
+			blockJSON map[string]interface{}
+			detailRlp string
+		)
+		if details[i] != nil {
+			if b, err := rlp.EncodeToBytes(details[i]); err != nil {
+				log.Warn("Failed to encode bad block detail", "hash", block.Hash(), "err", err)
+			} else {
+				detailRlp = hexutil.Encode(b)
+			}
+		}
+		if rlpBytes, err := rlp.EncodeToBytes(block); err != nil {
+			blockRlp = err.Error() // Hacky, but hey, it works
+		} else {
+			blockRlp = fmt.Sprintf("%#x", rlpBytes)
+		}
+		blockJSON = ethapi.RPCMarshalBlock(block, true, true, api.eth.APIBackend.ChainConfig())
+		results = append(results, &BadBlockArgs{
+			Hash:   block.Hash(),
+			RLP:    blockRlp,
+			Block:  blockJSON,
+			Detail: detailRlp,
+		})
+	}
+	if file != nil {
+		err := dumpBadBlocks(*file, results)
+		return nil, err
+	}
+	return results, nil
+}
+
+// dumpBadBlocks writes the bad blocks to path as JSON.
+//
+// It refuses to touch an existing file: the path comes from the caller, so
+// clobbering whatever happens to be there would turn this into an
+// arbitrary-write primitive. The file is created exclusively rather than stat-ed
+// first, so that two concurrent calls cannot both decide the path is free.
+func dumpBadBlocks(path string, results []*BadBlockArgs) error {
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	if err != nil {
+		if os.IsExist(err) {
+			return errors.New("location would overwrite an existing file")
+		}
+		return err
+	}
+	defer out.Close()
+
+	return json.NewEncoder(out).Encode(results)
+}
+
+// AccountRangeMaxResults is the maximum number of results to be returned per call
+const AccountRangeMaxResults = 256
+
+// AccountRange enumerates all accounts in the given block and start point in paging request
+func (api *DebugAPI) AccountRange(blockNrOrHash rpc.BlockNumberOrHash, start hexutil.Bytes, maxResults int, nocode, nostorage, incompletes bool) (state.Dump, error) {
+	var stateDb *state.StateDB
+	var err error
+
+	if number, ok := blockNrOrHash.Number(); ok {
+		if number == rpc.PendingBlockNumber {
+			// If we're dumping the pending state, we need to request
+			// both the pending block as well as the pending state from
+			// the miner and operate on those
+			_, _, stateDb = api.eth.miner.Pending()
+			if stateDb == nil {
+				return state.Dump{}, errors.New("pending state is not available")
+			}
+		} else {
+			var header *types.Header
+			switch number {
+			case rpc.LatestBlockNumber:
+				header = api.eth.blockchain.CurrentBlock()
+			case rpc.FinalizedBlockNumber:
+				header = api.eth.blockchain.CurrentFinalBlock()
+			case rpc.SafeBlockNumber:
+				header = api.eth.blockchain.CurrentSafeBlock()
+			default:
+				block := api.eth.blockchain.GetBlockByNumber(uint64(number))
+				if block == nil {
+					return state.Dump{}, fmt.Errorf("block #%d not found", number)
+				}
+				header = block.Header()
+			}
+			if header == nil {
+				return state.Dump{}, fmt.Errorf("block #%d not found", number)
+			}
+			stateDb, err = api.eth.BlockChain().StateAt(header.Root, header.Number, header.Time)
+			if err != nil {
+				return state.Dump{}, err
+			}
+		}
+	} else if hash, ok := blockNrOrHash.Hash(); ok {
+		block := api.eth.blockchain.GetBlockByHash(hash)
+		if block == nil {
+			return state.Dump{}, fmt.Errorf("block %s not found", hash.Hex())
+		}
+		stateDb, err = api.eth.BlockChain().StateAt(block.Root(), block.Number(), block.Time())
+		if err != nil {
+			return state.Dump{}, err
+		}
+	} else {
+		return state.Dump{}, errors.New("either block number or block hash must be specified")
+	}
+
+	opts := &state.DumpConfig{
+		SkipCode:          nocode,
+		SkipStorage:       nostorage,
+		OnlyWithAddresses: !incompletes,
+		Start:             start,
+		Max:               uint64(maxResults),
+	}
+	if maxResults > AccountRangeMaxResults || maxResults <= 0 {
+		opts.Max = AccountRangeMaxResults
+	}
+	return stateDb.RawDump(opts), nil
+}
+
+// StorageRangeResult is the result of a debug_storageRangeAt API call.
+type StorageRangeResult struct {
+	Storage storageMap   `json:"storage"`
+	NextKey *common.Hash `json:"nextKey"` // nil if Storage includes the last key in the trie.
+}
+
+type storageMap map[common.Hash]storageEntry
+
+type storageEntry struct {
+	Key   *common.Hash `json:"key"`
+	Value common.Hash  `json:"value"`
+}
+
+// StorageRangeAt returns the storage at the given block height and transaction index.
+func (api *DebugAPI) StorageRangeAt(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash, txIndex int, contractAddress common.Address, keyStart hexutil.Bytes, maxResult int) (StorageRangeResult, error) {
+	var block *types.Block
+
+	block, err := api.eth.APIBackend.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if err != nil {
+		return StorageRangeResult{}, err
+	}
+	if block == nil {
+		return StorageRangeResult{}, fmt.Errorf("block %v not found", blockNrOrHash)
+	}
+	_, _, statedb, release, err := api.eth.stateAtTransaction(ctx, block, txIndex)
+	if err != nil {
+		return StorageRangeResult{}, err
+	}
+	defer release()
+
+	return storageRangeAt(statedb, block.Root(), contractAddress, keyStart, maxResult)
+}
+
+func storageRangeAt(statedb *state.StateDB, root common.Hash, address common.Address, start []byte, maxResult int) (StorageRangeResult, error) {
+	storageRoot := statedb.GetStorageRoot(address)
+	if storageRoot == types.EmptyRootHash || storageRoot == (common.Hash{}) {
+		return StorageRangeResult{}, nil // empty storage
+	}
+	// TODO(rjl493456442) it's problematic for traversing the state with in-memory
+	// state mutations, specifically txIndex != 0.
+	id := trie.StorageTrieID(root, crypto.Keccak256Hash(address.Bytes()), storageRoot)
+	tr, err := trie.NewStateTrie(id, statedb.Database().TrieDB())
+	if err != nil {
+		return StorageRangeResult{}, err
+	}
+	trieIt, err := tr.NodeIterator(start)
+	if err != nil {
+		return StorageRangeResult{}, err
+	}
+	it := trie.NewIterator(trieIt)
+	result := StorageRangeResult{Storage: storageMap{}}
+	for i := 0; i < maxResult && it.Next(); i++ {
+		_, content, _, err := rlp.Split(it.Value)
+		if err != nil {
+			return StorageRangeResult{}, err
+		}
+		e := storageEntry{Value: common.BytesToHash(content)}
+		if preimage := tr.GetKey(it.Key); preimage != nil {
+			preimage := common.BytesToHash(preimage)
+			e.Key = &preimage
+		}
+		result.Storage[common.BytesToHash(it.Key)] = e
+	}
+	// Add the 'next key' so clients can continue downloading.
+	if it.Next() {
+		next := common.BytesToHash(it.Key)
+		result.NextKey = &next
+	}
+	// Iterator.Next returns false on both exhaustion and error, so a failure to
+	// resolve a trie node mid-range would otherwise be reported as a complete
+	// result (a nil NextKey claims all keys were returned). Surface the error
+	// instead of silently truncating.
+	if it.Err != nil {
+		return StorageRangeResult{}, it.Err
+	}
+	return result, nil
+}
+
+// GetModifiedAccountsByNumber returns all accounts that have changed between the
+// two blocks specified. A change is defined as a difference in nonce, balance,
+// code hash, or storage hash.
+//
+// With one parameter, returns the list of accounts modified in the specified block.
+func (api *DebugAPI) GetModifiedAccountsByNumber(startNum uint64, endNum *uint64) ([]common.Address, error) {
+	var startHeader, endHeader *types.Header
+
+	startHeader = api.eth.blockchain.GetHeaderByNumber(startNum)
+	if startHeader == nil {
+		return nil, fmt.Errorf("start block %x not found", startNum)
+	}
+
+	if endNum == nil {
+		endHeader = startHeader
+		startHeader = api.eth.blockchain.GetHeaderByHash(startHeader.ParentHash)
+		if startHeader == nil {
+			return nil, fmt.Errorf("block %x has no parent", endHeader.Number)
+		}
+	} else {
+		endHeader = api.eth.blockchain.GetHeaderByNumber(*endNum)
+		if endHeader == nil {
+			return nil, fmt.Errorf("end block %d not found", *endNum)
+		}
+	}
+	return api.getModifiedAccounts(startHeader, endHeader)
+}
+
+// GetModifiedAccountsByHash returns all accounts that have changed between the
+// two blocks specified. A change is defined as a difference in nonce, balance,
+// code hash, or storage hash.
+//
+// With one parameter, returns the list of accounts modified in the specified block.
+func (api *DebugAPI) GetModifiedAccountsByHash(startHash common.Hash, endHash *common.Hash) ([]common.Address, error) {
+	var startHeader, endHeader *types.Header
+	startHeader = api.eth.blockchain.GetHeaderByHash(startHash)
+	if startHeader == nil {
+		return nil, fmt.Errorf("start block %x not found", startHash)
+	}
+
+	if endHash == nil {
+		endHeader = startHeader
+		startHeader = api.eth.blockchain.GetHeaderByHash(startHeader.ParentHash)
+		if startHeader == nil {
+			return nil, fmt.Errorf("block %x has no parent", endHeader.Number)
+		}
+	} else {
+		endHeader = api.eth.blockchain.GetHeaderByHash(*endHash)
+		if endHeader == nil {
+			return nil, fmt.Errorf("end block %x not found", *endHash)
+		}
+	}
+	return api.getModifiedAccounts(startHeader, endHeader)
+}
+
+func (api *DebugAPI) getModifiedAccounts(startHeader, endHeader *types.Header) ([]common.Address, error) {
+	if startHeader.Number.Uint64() >= endHeader.Number.Uint64() {
+		return nil, fmt.Errorf("start block height (%d) must be less than end block height (%d)", startHeader.Number.Uint64(), endHeader.Number.Uint64())
+	}
+	triedb := api.eth.BlockChain().TrieDB()
+
+	oldTrie, err := trie.NewStateTrie(trie.StateTrieID(startHeader.Root), triedb)
+	if err != nil {
+		return nil, err
+	}
+	newTrie, err := trie.NewStateTrie(trie.StateTrieID(endHeader.Root), triedb)
+	if err != nil {
+		return nil, err
+	}
+	oldIt, err := oldTrie.NodeIterator([]byte{})
+	if err != nil {
+		return nil, err
+	}
+	newIt, err := newTrie.NodeIterator([]byte{})
+	if err != nil {
+		return nil, err
+	}
+	diff, _ := trie.NewDifferenceIterator(oldIt, newIt)
+	iter := trie.NewIterator(diff)
+
+	var dirty []common.Address
+	for iter.Next() {
+		key := newTrie.GetKey(iter.Key)
+		if key == nil {
+			return nil, fmt.Errorf("no preimage found for hash %x", iter.Key)
+		}
+		dirty = append(dirty, common.BytesToAddress(key))
+	}
+	// Iterator.Next returns false on both exhaustion and error, so a failure to
+	// resolve a trie node mid-traversal would otherwise be reported as a complete
+	// set of modified accounts. Surface the error instead of silently truncating.
+	if iter.Err != nil {
+		return nil, iter.Err
+	}
+	return dirty, nil
+}
+
+// GetAccessibleState returns the first number where the node has accessible
+// state on disk. Note this being the post-state of that block and the pre-state
+// of the next block.
+// The (from, to) parameters are the sequence of blocks to search, which can go
+// either forwards or backwards
+func (api *DebugAPI) GetAccessibleState(from, to rpc.BlockNumber) (uint64, error) {
+	if api.eth.blockchain.TrieDB().Scheme() == rawdb.PathScheme {
+		return 0, errors.New("state history is not yet available in path-based scheme")
+	}
+	db := api.eth.ChainDb()
+	var pivot uint64
+	if p := rawdb.ReadLastPivotNumber(db); p != nil {
+		pivot = *p
+		log.Info("Found fast-sync pivot marker", "number", pivot)
+	}
+	var resolveNum = func(num rpc.BlockNumber) (uint64, error) {
+		// We don't have state for pending (-2), so treat it as latest
+		if num.Int64() < 0 {
+			block := api.eth.blockchain.CurrentBlock()
+			if block == nil {
+				return 0, errors.New("current block missing")
+			}
+			return block.Number.Uint64(), nil
+		}
+		return uint64(num.Int64()), nil
+	}
+	var (
+		start   uint64
+		end     uint64
+		delta   = int64(1)
+		lastLog time.Time
+		err     error
+	)
+	if start, err = resolveNum(from); err != nil {
+		return 0, err
+	}
+	if end, err = resolveNum(to); err != nil {
+		return 0, err
+	}
+	if start == end {
+		return 0, errors.New("from and to needs to be different")
+	}
+	if start > end {
+		delta = -1
+	}
+	for i := int64(start); i != int64(end); i += delta {
+		if time.Since(lastLog) > 8*time.Second {
+			log.Info("Finding roots", "from", start, "to", end, "at", i)
+			lastLog = time.Now()
+		}
+		if i < int64(pivot) {
+			continue
+		}
+		h := api.eth.BlockChain().GetHeaderByNumber(uint64(i))
+		if h == nil {
+			return 0, fmt.Errorf("missing header %d", i)
+		}
+		if ok, _ := api.eth.ChainDb().Has(h.Root[:]); ok {
+			return uint64(i), nil
+		}
+	}
+	return 0, errors.New("no state found")
+}
+
+// SetTrieFlushInterval configures how often in-memory tries are persisted
+// to disk. The value is in terms of block processing time, not wall clock.
+// If the value is shorter than the block generation time, or even 0 or negative,
+// the node will flush trie after processing each block (effectively archive mode).
+func (api *DebugAPI) SetTrieFlushInterval(interval string) error {
+	if api.eth.blockchain.TrieDB().Scheme() == rawdb.PathScheme {
+		return errors.New("trie flush interval is undefined for path-based scheme")
+	}
+	t, err := time.ParseDuration(interval)
+	if err != nil {
+		return err
+	}
+	api.eth.blockchain.SetTrieFlushInterval(t)
+	return nil
+}
+
+// GetTrieFlushInterval gets the current value of in-memory trie flush interval
+func (api *DebugAPI) GetTrieFlushInterval() (string, error) {
+	if api.eth.blockchain.TrieDB().Scheme() == rawdb.PathScheme {
+		return "", errors.New("trie flush interval is undefined for path-based scheme")
+	}
+	return api.eth.blockchain.GetTrieFlushInterval().String(), nil
+}
+
+func (api *DebugAPI) ExecutionWitness(bn rpc.BlockNumberOrHash) (*stateless.ExtWitness, error) {
+	bc := api.eth.blockchain
+	block, err := api.eth.APIBackend.BlockByNumberOrHash(context.Background(), bn)
+	if err != nil {
+		return &stateless.ExtWitness{}, fmt.Errorf("block %v not found", bn)
+	}
+	// BlockByNumberOrHash returns a nil block without an error when the
+	// requested block does not exist (per the RPC spec). Guard against it
+	// to avoid a nil pointer dereference below.
+	if block == nil {
+		return &stateless.ExtWitness{}, fmt.Errorf("block %v not found", bn)
+	}
+	parent := bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
+	if parent == nil {
+		return &stateless.ExtWitness{}, fmt.Errorf("block %v found, but parent missing", bn)
+	}
+	config := core.ExecuteConfig{
+		WriteState:   false,
+		EnableTracer: false,
+		MakeWitness:  true,
+	}
+	result, err := bc.ProcessBlock(context.Background(), parent.Root, block, config)
+	if err != nil {
+		return nil, err
+	}
+	return result.Witness().ToExtWitness(), nil
+}
+
+// ClearTxpool clears all transactions from the transaction pool.
+// This method removes all pending and queued transactions from both the
+// legacy transaction pool and the blob transaction pool.
+//
+// Note: This operation invokes Sync() internally and should be used with
+// caution as it can be susceptible to DoS vectors. It's primarily intended
+// for testing and debugging purposes.
+func (api *DebugAPI) ClearTxpool() error {
+	api.eth.TxPool().Clear()
+	return nil
+}

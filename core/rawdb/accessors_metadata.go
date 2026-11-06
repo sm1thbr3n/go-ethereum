@@ -18,6 +18,7 @@ package rawdb
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -27,10 +28,10 @@ import (
 )
 
 // ReadDatabaseVersion retrieves the version number of the database.
-func ReadDatabaseVersion(db ethdb.Reader) *uint64 {
+func ReadDatabaseVersion(db ethdb.KeyValueReader) *uint64 {
 	var version uint64
 
-	enc, _ := db.Get(databaseVerisionKey)
+	enc, _ := db.Get(databaseVersionKey)
 	if len(enc) == 0 {
 		return nil
 	}
@@ -42,18 +43,18 @@ func ReadDatabaseVersion(db ethdb.Reader) *uint64 {
 }
 
 // WriteDatabaseVersion stores the version number of the database
-func WriteDatabaseVersion(db ethdb.Writer, version uint64) {
+func WriteDatabaseVersion(db ethdb.KeyValueWriter, version uint64) {
 	enc, err := rlp.EncodeToBytes(version)
 	if err != nil {
 		log.Crit("Failed to encode database version", "err", err)
 	}
-	if err = db.Put(databaseVerisionKey, enc); err != nil {
+	if err = db.Put(databaseVersionKey, enc); err != nil {
 		log.Crit("Failed to store the database version", "err", err)
 	}
 }
 
 // ReadChainConfig retrieves the consensus settings based on the given genesis hash.
-func ReadChainConfig(db ethdb.Reader, hash common.Hash) *params.ChainConfig {
+func ReadChainConfig(db ethdb.KeyValueReader, hash common.Hash) *params.ChainConfig {
 	data, _ := db.Get(configKey(hash))
 	if len(data) == 0 {
 		return nil
@@ -67,7 +68,7 @@ func ReadChainConfig(db ethdb.Reader, hash common.Hash) *params.ChainConfig {
 }
 
 // WriteChainConfig writes the chain config settings to the database.
-func WriteChainConfig(db ethdb.Writer, hash common.Hash, cfg *params.ChainConfig) {
+func WriteChainConfig(db ethdb.KeyValueWriter, hash common.Hash, cfg *params.ChainConfig) {
 	if cfg == nil {
 		return
 	}
@@ -80,19 +81,96 @@ func WriteChainConfig(db ethdb.Writer, hash common.Hash, cfg *params.ChainConfig
 	}
 }
 
-// ReadPreimage retrieves a single preimage of the provided hash.
-func ReadPreimage(db ethdb.Reader, hash common.Hash) []byte {
-	data, _ := db.Get(preimageKey(hash))
+// ReadGenesisStateSpec retrieves the genesis state specification based on the
+// given genesis (block-)hash.
+func ReadGenesisStateSpec(db ethdb.KeyValueReader, blockhash common.Hash) []byte {
+	data, _ := db.Get(genesisStateSpecKey(blockhash))
 	return data
 }
 
-// WritePreimages writes the provided set of preimages to the database.
-func WritePreimages(db ethdb.Writer, preimages map[common.Hash][]byte) {
-	for hash, preimage := range preimages {
-		if err := db.Put(preimageKey(hash), preimage); err != nil {
-			log.Crit("Failed to store trie preimage", "err", err)
+// WriteGenesisStateSpec writes the genesis state specification into the disk.
+func WriteGenesisStateSpec(db ethdb.KeyValueWriter, blockhash common.Hash, data []byte) {
+	if err := db.Put(genesisStateSpecKey(blockhash), data); err != nil {
+		log.Crit("Failed to store genesis state", "err", err)
+	}
+}
+
+// crashList is a list of unclean-shutdown-markers, for rlp-encoding to the
+// database
+type crashList struct {
+	Discarded uint64   // how many ucs have we deleted
+	Recent    []uint64 // unix timestamps of 10 latest unclean shutdowns
+}
+
+const crashesToKeep = 10
+
+// PushUncleanShutdownMarker appends a new unclean shutdown marker and returns
+// the previous data
+// - a list of timestamps
+// - a count of how many old unclean-shutdowns have been discarded
+func PushUncleanShutdownMarker(db ethdb.KeyValueStore) ([]uint64, uint64, error) {
+	var uncleanShutdowns crashList
+	// Read old data
+	if data, err := db.Get(uncleanShutdownKey); err == nil {
+		if err := rlp.DecodeBytes(data, &uncleanShutdowns); err != nil {
+			return nil, 0, err
 		}
 	}
-	preimageCounter.Inc(int64(len(preimages)))
-	preimageHitCounter.Inc(int64(len(preimages)))
+	var discarded = uncleanShutdowns.Discarded
+	var previous = make([]uint64, len(uncleanShutdowns.Recent))
+	copy(previous, uncleanShutdowns.Recent)
+	// Add a new (but cap it)
+	uncleanShutdowns.Recent = append(uncleanShutdowns.Recent, uint64(time.Now().Unix()))
+	if count := len(uncleanShutdowns.Recent); count > crashesToKeep+1 {
+		numDel := count - (crashesToKeep + 1)
+		uncleanShutdowns.Recent = uncleanShutdowns.Recent[numDel:]
+		uncleanShutdowns.Discarded += uint64(numDel)
+	}
+	// And save it again
+	data, _ := rlp.EncodeToBytes(uncleanShutdowns)
+	if err := db.Put(uncleanShutdownKey, data); err != nil {
+		log.Warn("Failed to write unclean-shutdown marker", "err", err)
+		return nil, 0, err
+	}
+	return previous, discarded, nil
+}
+
+// PopUncleanShutdownMarker removes the last unclean shutdown marker
+func PopUncleanShutdownMarker(db ethdb.KeyValueStore) {
+	var uncleanShutdowns crashList
+	// Read old data
+	if data, err := db.Get(uncleanShutdownKey); err != nil {
+		log.Warn("Error reading unclean shutdown markers", "error", err)
+	} else if err := rlp.DecodeBytes(data, &uncleanShutdowns); err != nil {
+		log.Error("Error decoding unclean shutdown markers", "error", err) // Should mos def _not_ happen
+	}
+	if l := len(uncleanShutdowns.Recent); l > 0 {
+		uncleanShutdowns.Recent = uncleanShutdowns.Recent[:l-1]
+	}
+	data, _ := rlp.EncodeToBytes(uncleanShutdowns)
+	if err := db.Put(uncleanShutdownKey, data); err != nil {
+		log.Warn("Failed to clear unclean-shutdown marker", "err", err)
+	}
+}
+
+// UpdateUncleanShutdownMarker updates the last marker's timestamp to now.
+func UpdateUncleanShutdownMarker(db ethdb.KeyValueStore) {
+	var uncleanShutdowns crashList
+	// Read old data
+	if data, err := db.Get(uncleanShutdownKey); err != nil {
+		log.Warn("Error reading unclean shutdown markers", "error", err)
+	} else if err := rlp.DecodeBytes(data, &uncleanShutdowns); err != nil {
+		log.Warn("Error decoding unclean shutdown markers", "error", err)
+	}
+	// This shouldn't happen because we push a marker on Backend instantiation
+	count := len(uncleanShutdowns.Recent)
+	if count == 0 {
+		log.Warn("No unclean shutdown marker to update")
+		return
+	}
+	uncleanShutdowns.Recent[count-1] = uint64(time.Now().Unix())
+	data, _ := rlp.EncodeToBytes(uncleanShutdowns)
+	if err := db.Put(uncleanShutdownKey, data); err != nil {
+		log.Warn("Failed to write unclean-shutdown marker", "err", err)
+	}
 }

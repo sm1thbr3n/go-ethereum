@@ -17,15 +17,24 @@
 package rpc
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
 func TestNewID(t *testing.T) {
+	t.Parallel()
+
 	hexchars := "0123456789ABCDEFabcdef"
 	for i := 0; i < 100; i++ {
 		id := string(NewID())
@@ -47,8 +56,10 @@ func TestNewID(t *testing.T) {
 }
 
 func TestSubscriptions(t *testing.T) {
+	t.Parallel()
+
 	var (
-		namespaces        = []string{"eth", "shh", "bzz"}
+		namespaces        = []string{"eth"}
 		service           = &notificationTestService{}
 		subCount          = len(namespaces)
 		notificationCount = 3
@@ -68,7 +79,7 @@ func TestSubscriptions(t *testing.T) {
 			t.Fatalf("unable to register test service %v", err)
 		}
 	}
-	go server.ServeCodec(NewJSONCodec(serverConn), OptionMethodInvocation|OptionSubscriptions)
+	go server.ServeCodec(NewCodec(serverConn), 0)
 	defer server.Stop()
 
 	// wait for message and write them to the given channels
@@ -79,7 +90,7 @@ func TestSubscriptions(t *testing.T) {
 		request := map[string]interface{}{
 			"id":      i,
 			"method":  fmt.Sprintf("%s_subscribe", namespace),
-			"version": "2.0",
+			"jsonrpc": "2.0",
 			"params":  []interface{}{"someSubscription", notificationCount, i},
 		}
 		if err := out.Encode(&request); err != nil {
@@ -125,22 +136,27 @@ func TestSubscriptions(t *testing.T) {
 
 // This test checks that unsubscribing works.
 func TestServerUnsubscribe(t *testing.T) {
+	t.Parallel()
+
+	p1, p2 := net.Pipe()
+	defer p2.Close()
+
 	// Start the server.
 	server := newTestServer()
-	service := &notificationTestService{unsubscribed: make(chan string)}
+	service := &notificationTestService{unsubscribed: make(chan string, 1)}
 	server.RegisterName("nftest2", service)
-	p1, p2 := net.Pipe()
-	go server.ServeCodec(NewJSONCodec(p1), OptionMethodInvocation|OptionSubscriptions)
-
-	p2.SetDeadline(time.Now().Add(10 * time.Second))
+	go server.ServeCodec(NewCodec(p1), 0)
 
 	// Subscribe.
+	p2.SetDeadline(time.Now().Add(10 * time.Second))
 	p2.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"nftest2_subscribe","params":["someSubscription",0,10]}`))
 
 	// Handle received messages.
-	resps := make(chan subConfirmation)
-	notifications := make(chan subscriptionResult)
-	errors := make(chan error)
+	var (
+		resps         = make(chan subConfirmation)
+		notifications = make(chan subscriptionResult)
+		errors        = make(chan error, 1)
+	)
 	go waitForMessages(json.NewDecoder(p2), resps, notifications, errors)
 
 	// Receive the subscription ID.
@@ -173,34 +189,105 @@ type subConfirmation struct {
 	subid ID
 }
 
+// waitForMessages reads RPC messages from 'in' and dispatches them into the given channels.
+// It stops if there is an error.
 func waitForMessages(in *json.Decoder, successes chan subConfirmation, notifications chan subscriptionResult, errors chan error) {
 	for {
-		var msg jsonrpcMessage
-		if err := in.Decode(&msg); err != nil {
-			errors <- fmt.Errorf("decode error: %v", err)
+		resp, notification, err := readAndValidateMessage(in)
+		if err != nil {
+			errors <- err
 			return
+		} else if resp != nil {
+			successes <- *resp
+		} else {
+			notifications <- *notification
 		}
-		switch {
-		case msg.isNotification():
-			var res subscriptionResult
-			if err := json.Unmarshal(msg.Params, &res); err != nil {
-				errors <- fmt.Errorf("invalid subscription result: %v", err)
-			} else {
-				notifications <- res
-			}
-		case msg.isResponse():
-			var c subConfirmation
-			if msg.Error != nil {
-				errors <- msg.Error
-			} else if err := json.Unmarshal(msg.Result, &c.subid); err != nil {
-				errors <- fmt.Errorf("invalid response: %v", err)
-			} else {
-				json.Unmarshal(msg.ID, &c.reqid)
-				successes <- c
-			}
-		default:
-			errors <- fmt.Errorf("unrecognized message: %v", msg)
-			return
+	}
+}
+
+func readAndValidateMessage(in *json.Decoder) (*subConfirmation, *subscriptionResult, error) {
+	var msg jsonrpcMessage
+	if err := in.Decode(&msg); err != nil {
+		return nil, nil, fmt.Errorf("decode error: %v", err)
+	}
+	switch {
+	case msg.isNotification():
+		var res subscriptionResult
+		if err := json.Unmarshal(msg.Params, &res); err != nil {
+			return nil, nil, fmt.Errorf("invalid subscription result: %v", err)
 		}
+		return nil, &res, nil
+	case msg.isResponse():
+		var c subConfirmation
+		if msg.Error != nil {
+			return nil, nil, msg.decodeError()
+		} else if err := json.Unmarshal(msg.Result, &c.subid); err != nil {
+			return nil, nil, fmt.Errorf("invalid response: %v", err)
+		} else {
+			json.Unmarshal(msg.ID, &c.reqid)
+			return &c, nil, nil
+		}
+	default:
+		return nil, nil, fmt.Errorf("unrecognized message: %v", msg)
+	}
+}
+
+type mockConn struct {
+	w io.Writer
+}
+
+func (c *mockConn) writeJSON(ctx context.Context, msg *jsonrpcMessage, isError bool) error {
+	buf := appendMessage(nil, msg)
+	buf = append(buf, '\n')
+	_, err := c.w.Write(buf)
+	return err
+}
+
+func (c *mockConn) writeJSONBatch(ctx context.Context, msgs []*jsonrpcMessage, isError bool) error {
+	buf := appendBatch(nil, msgs)
+	buf = append(buf, '\n')
+	_, err := c.w.Write(buf)
+	return err
+}
+
+// closed returns a channel which is closed when the connection is closed.
+func (c *mockConn) closed() <-chan interface{} { return nil }
+
+// remoteAddr returns the peer address of the connection.
+func (c *mockConn) remoteAddr() string { return "" }
+
+// BenchmarkNotify benchmarks the performance of notifying a subscription.
+func BenchmarkNotify(b *testing.B) {
+	id := ID("test")
+	notifier := &Notifier{
+		h:         &handler{conn: &mockConn{io.Discard}},
+		sub:       &Subscription{ID: id},
+		activated: true,
+	}
+	msg := &types.Header{
+		ParentHash: common.HexToHash("0x01"),
+		Number:     big.NewInt(100),
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		notifier.Notify(id, msg)
+	}
+}
+
+func TestNotify(t *testing.T) {
+	t.Parallel()
+
+	out := new(bytes.Buffer)
+	id := ID("test")
+	notifier := &Notifier{
+		h:         &handler{conn: &mockConn{out}},
+		sub:       &Subscription{ID: id},
+		activated: true,
+	}
+	notifier.Notify(id, "hello")
+	have := strings.TrimSpace(out.String())
+	want := `{"jsonrpc":"2.0","method":"_subscription","params":{"subscription":"test","result":"hello"}}`
+	if have != want {
+		t.Errorf("have:\n%v\nwant:\n%v\n", have, want)
 	}
 }

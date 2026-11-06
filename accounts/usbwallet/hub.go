@@ -20,12 +20,13 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/karalabe/hid"
+	"github.com/ethereum/hid"
 )
 
 // LedgerScheme is the protocol scheme prefixing account and wallet URLs.
@@ -41,6 +42,14 @@ const refreshCycle = time.Second
 // refreshThrottling is the minimum time between wallet refreshes to avoid USB
 // trashing.
 const refreshThrottling = 500 * time.Millisecond
+
+const (
+	// deviceUsagePage identifies Ledger devices by HID usage page (0xffa0) on Windows and macOS.
+	// See: https://github.com/LedgerHQ/ledger-live/blob/05a2980e838955a11a1418da638ef8ac3df4fb74/libs/ledgerjs/packages/hw-transport-node-hid-noevents/src/TransportNodeHid.ts
+	deviceUsagePage = 0xffa0
+	// deviceInterface identifies Ledger devices by USB interface number (0) on Linux.
+	deviceInterface = 0
+)
 
 // Hub is a accounts.Backend that can find and handle generic USB hardware wallets.
 type Hub struct {
@@ -62,18 +71,46 @@ type Hub struct {
 	stateLock sync.RWMutex // Protects the internals of the hub from racey access
 
 	// TODO(karalabe): remove if hotplug lands on Windows
-	commsPend int        // Number of operations blocking enumeration
-	commsLock sync.Mutex // Lock protecting the pending counter and enumeration
+	commsPend int           // Number of operations blocking enumeration
+	commsLock sync.Mutex    // Lock protecting the pending counter and enumeration
+	enumFails atomic.Uint32 // Number of times enumeration has failed
 }
 
 // NewLedgerHub creates a new hardware wallet manager for Ledger devices.
 func NewLedgerHub() (*Hub, error) {
-	return newHub(LedgerScheme, 0x2c97, []uint16{0x0000 /* Ledger Blue */, 0x0001 /* Ledger Nano S */}, 0xffa0, 0, newLedgerDriver)
+	return newHub(LedgerScheme, 0x2c97, []uint16{
+
+		// Device definitions taken from
+		// https://github.com/LedgerHQ/ledger-live/blob/595cb73b7e6622dbbcfc11867082ddc886f1bf01/libs/ledgerjs/packages/devices/src/index.ts
+
+		// Original product IDs
+		0x0000, /* Ledger Blue */
+		0x0001, /* Ledger Nano S */
+		0x0004, /* Ledger Nano X */
+		0x0005, /* Ledger Nano S Plus */
+		0x0006, /* Ledger Nano FTS */
+		0x0007, /* Ledger Flex */
+		0x0008, /* Ledger Nano Gen5 */
+
+		0x0000, /* WebUSB Ledger Blue */
+		0x1000, /* WebUSB Ledger Nano S */
+		0x4000, /* WebUSB Ledger Nano X */
+		0x5000, /* WebUSB Ledger Nano S Plus */
+		0x6000, /* WebUSB Ledger Nano FTS */
+		0x7000, /* WebUSB Ledger Flex */
+		0x8000, /* WebUSB Ledger Nano Gen5 */
+	}, deviceUsagePage, deviceInterface, newLedgerDriver)
 }
 
-// NewTrezorHub creates a new hardware wallet manager for Trezor devices.
-func NewTrezorHub() (*Hub, error) {
-	return newHub(TrezorScheme, 0x534c, []uint16{0x0001 /* Trezor 1 */}, 0xff00, 0, newTrezorDriver)
+// NewTrezorHubWithHID creates a new hardware wallet manager for Trezor devices.
+func NewTrezorHubWithHID() (*Hub, error) {
+	return newHub(TrezorScheme, 0x534c, []uint16{0x0001 /* Trezor HID */}, 0xff00, 0, newTrezorDriver)
+}
+
+// NewTrezorHubWithWebUSB creates a new hardware wallet manager for Trezor devices with
+// firmware version > 1.8.0
+func NewTrezorHubWithWebUSB() (*Hub, error) {
+	return newHub(TrezorScheme, 0x1209, []uint16{0x53c1 /* Trezor WebUSB */}, 0xffff /* No usage id on webusb, don't match unset (0) */, 0, newTrezorDriver)
 }
 
 // newHub creates a new hardware wallet manager for generic USB devices.
@@ -119,6 +156,10 @@ func (hub *Hub) refreshWallets() {
 	if elapsed < refreshThrottling {
 		return
 	}
+	// If USB enumeration is continually failing, don't keep trying indefinitely
+	if hub.enumFails.Load() > 2 {
+		return
+	}
 	// Retrieve the current list of USB wallet devices
 	var devices []hid.DeviceInfo
 
@@ -135,9 +176,26 @@ func (hub *Hub) refreshWallets() {
 			return
 		}
 	}
-	for _, info := range hid.Enumerate(hub.vendorID, 0) {
+	infos, err := hid.Enumerate(hub.vendorID, 0)
+	if err != nil {
+		failcount := hub.enumFails.Add(1)
+		if runtime.GOOS == "linux" {
+			// See rationale before the enumeration why this is needed and only on Linux.
+			hub.commsLock.Unlock()
+		}
+		log.Error("Failed to enumerate USB devices", "hub", hub.scheme,
+			"vendor", hub.vendorID, "failcount", failcount, "err", err)
+		return
+	}
+	hub.enumFails.Store(0)
+
+	for _, info := range infos {
 		for _, id := range hub.productIDs {
-			if info.ProductID == id && (info.UsagePage == hub.usageID || info.Interface == hub.endpointID) {
+			// We check both the raw ProductID (legacy) and just the upper byte, as Ledger
+			// uses `MMII`, encoding a model (MM) and an interface bitfield (II)
+			mmOnly := info.ProductID & 0xff00
+			// Windows and Macos use UsageID matching, Linux uses Interface matching
+			if (info.ProductID == id || mmOnly == id) && (info.UsagePage == hub.usageID || info.Interface == hub.endpointID) {
 				devices = append(devices, info)
 				break
 			}

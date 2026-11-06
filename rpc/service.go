@@ -1,4 +1,4 @@
-// Copyright 2015 The go-ethereum Authors
+// Copyright 2019 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -18,23 +18,21 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/log"
 )
 
 var (
-	contextType      = reflect.TypeOf((*context.Context)(nil)).Elem()
-	errorType        = reflect.TypeOf((*error)(nil)).Elem()
-	subscriptionType = reflect.TypeOf(Subscription{})
-	stringType       = reflect.TypeOf("")
+	contextType      = reflect.TypeFor[context.Context]()
+	errorType        = reflect.TypeFor[error]()
+	subscriptionType = reflect.TypeFor[Subscription]()
+	stringType       = reflect.TypeFor[string]()
 )
 
 type serviceRegistry struct {
@@ -93,15 +91,19 @@ func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
 	return nil
 }
 
+func serviceAndMethod(name string) (service, method string, ok bool) {
+	return strings.Cut(name, serviceMethodSeparator)
+}
+
 // callback returns the callback corresponding to the given RPC method name.
-func (r *serviceRegistry) callback(method string) *callback {
-	elem := strings.SplitN(method, serviceMethodSeparator, 2)
-	if len(elem) != 2 {
+func (r *serviceRegistry) callback(name string) (cb *callback) {
+	s, m, found := serviceAndMethod(name)
+	if !found {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.services[elem[0]].callbacks[elem[1]]
+	return r.services[s].callbacks[m]
 }
 
 // subscription returns a subscription callback in the given service.
@@ -112,7 +114,7 @@ func (r *serviceRegistry) subscription(service, name string) *callback {
 }
 
 // suitableCallbacks iterates over the methods of the given type. It determines if a method
-// satisfies the criteria for a RPC callback or a subscription callback and adds it to the
+// satisfies the criteria for an RPC callback or a subscription callback and adds it to the
 // collection of callbacks. See server documentation for a summary of these criteria.
 func suitableCallbacks(receiver reflect.Value) map[string]*callback {
 	typ := receiver.Type()
@@ -139,16 +141,14 @@ func newCallback(receiver, fn reflect.Value) *callback {
 	c := &callback{fn: fn, rcvr: receiver, errPos: -1, isSubscribe: isPubSub(fntype)}
 	// Determine parameter types. They must all be exported or builtin types.
 	c.makeArgTypes()
-	if !allExportedOrBuiltin(c.argTypes) {
-		return nil
-	}
+
 	// Verify return types. The function must return at most one error
 	// and/or one other non-error value.
 	outs := make([]reflect.Type, fntype.NumOut())
 	for i := 0; i < fntype.NumOut(); i++ {
 		outs[i] = fntype.Out(i)
 	}
-	if len(outs) > 2 || !allExportedOrBuiltin(outs) {
+	if len(outs) > 2 {
 		return nil
 	}
 	// If an error is returned, it must be the last returned value.
@@ -202,7 +202,7 @@ func (c *callback) call(ctx context.Context, method string, args []reflect.Value
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			log.Error("RPC method " + method + " crashed: " + fmt.Sprintf("%v\n%s", err, buf))
-			errRes = errors.New("method handler crashed")
+			errRes = &internalServerError{errcodePanic, "method handler crashed"}
 		}
 	}()
 	// Run the callback.
@@ -218,59 +218,27 @@ func (c *callback) call(ctx context.Context, method string, args []reflect.Value
 	return results[0].Interface(), nil
 }
 
-// Is this an exported - upper case - name?
-func isExported(name string) bool {
-	rune, _ := utf8.DecodeRuneInString(name)
-	return unicode.IsUpper(rune)
-}
-
-// Are all those types exported or built-in?
-func allExportedOrBuiltin(types []reflect.Type) bool {
-	for _, typ := range types {
-		for typ.Kind() == reflect.Ptr {
-			typ = typ.Elem()
-		}
-		// PkgPath will be non-empty even for an exported type,
-		// so we need to check the type name as well.
-		if !isExported(typ.Name()) && typ.PkgPath() != "" {
-			return false
-		}
-	}
-	return true
-}
-
-// Is t context.Context or *context.Context?
-func isContextType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	return t == contextType
-}
-
 // Does t satisfy the error interface?
 func isErrorType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
 	return t.Implements(errorType)
 }
 
 // Is t Subscription or *Subscription?
 func isSubscriptionType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	return t == subscriptionType
 }
 
-// isPubSub tests whether the given method has as as first argument a context.Context and
+// isPubSub tests whether the given method's first argument is a context.Context and
 // returns the pair (Subscription, error).
 func isPubSub(methodType reflect.Type) bool {
 	// numIn(0) is the receiver type
 	if methodType.NumIn() < 2 || methodType.NumOut() != 2 {
 		return false
 	}
-	return isContextType(methodType.In(1)) &&
+	return methodType.In(1) == contextType &&
 		isSubscriptionType(methodType.Out(0)) &&
 		isErrorType(methodType.Out(1))
 }

@@ -51,6 +51,34 @@ func hexToCompact(hex []byte) []byte {
 	return buf
 }
 
+// hexToCompactInPlace places the compact key in input buffer, returning the compacted key.
+func hexToCompactInPlace(hex []byte) []byte {
+	var (
+		hexLen    = len(hex) // length of the hex input
+		firstByte = byte(0)
+	)
+	// Check if we have a terminator there
+	if hexLen > 0 && hex[hexLen-1] == 16 {
+		firstByte = 1 << 5
+		hexLen-- // last part was the terminator, ignore that
+	}
+	var (
+		binLen = hexLen/2 + 1
+		ni     = 0 // index in hex
+		bi     = 1 // index in bin (compact)
+	)
+	if hexLen&1 == 1 {
+		firstByte |= 1 << 4 // odd flag
+		firstByte |= hex[0] // first nibble is contained in the first byte
+		ni++
+	}
+	for ; ni < hexLen; bi, ni = bi+1, ni+2 {
+		hex[bi] = hex[ni]<<4 | hex[ni+1]
+	}
+	hex[0] = firstByte
+	return hex[:binLen]
+}
+
 func compactToHex(compact []byte) []byte {
 	if len(compact) == 0 {
 		return compact
@@ -74,6 +102,18 @@ func keybytesToHex(str []byte) []byte {
 	}
 	nibbles[l-1] = 16
 	return nibbles
+}
+
+// writeHexKey writes the hexkey into the given slice.
+// OBS! This method omits the termination flag.
+// OBS! The dst slice must be at least 2x as large as the key
+func writeHexKey(dst []byte, key []byte) []byte {
+	_ = dst[2*len(key)-1]
+	for i, b := range key {
+		dst[i*2] = b / 16
+		dst[i*2+1] = b % 16
+	}
+	return dst[:2*len(key)]
 }
 
 // hexToKeybytes turns hex nibbles into key bytes.
